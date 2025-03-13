@@ -85,7 +85,9 @@ class TokenConfidence(nn.Module):
         super().__init__()
         self.token = nn.Sequential(
             nn.Linear(dim, dim // 2),
+            nn.ReLU(),
             nn.Linear(dim // 2, dim // 4),
+            nn.ReLU(),
             nn.Linear(dim // 4, 1),
             nn.Sigmoid(),
         )
