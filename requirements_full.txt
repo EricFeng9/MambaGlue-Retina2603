@@ -1,0 +1,25 @@
+# 基础依赖
+torch>=2.1.0
+torchvision>=0.3
+numpy
+opencv-python
+matplotlib
+kornia>=0.6.11
+
+# PyTorch Lightning 和相关
+pytorch-lightning>=2.0.0
+tensorboard
+
+# 日志
+loguru
+
+# Mamba 相关
+mamba-ssm
+einops
+
+# 其他工具
+omegaconf
+pyyaml
+tqdm
+pillow
+scipy

@@ -593,33 +593,46 @@ class MambaGlue(nn.Module):
             # )
 
             ##### LOCAL weight
-            local_path = Path(
-                "checkpoint_best.tar"
-            )  # local path for your own weight (.tar or .pth)
-            print(f"Attempting to load from: {local_path}")
+            # 优先尝试加载官方预训练权重
+            local_path = Path("superpoint_mambaglue.tar")
+            
+            # 如果官方权重不存在，尝试加载自定义权重
             if not local_path.exists():
-                raise FileNotFoundError(
-                    f"Weights file not found at {local_path}. Please download it manually."
-                )
-
-            checkpoint = torch.load(str(local_path), map_location="cpu")
-
-            # Extract only the model weights from the checkpoint
-            if "model" in checkpoint:
-                state_dict = checkpoint["model"]
-                print("Successfully extracted model weights from the checkpoint.")
+                local_path = Path("checkpoint_best.tar")
+            
+            print(f"Attempting to load MambaGlue weights from: {local_path}")
+            
+            if not local_path.exists():
+                print(f"⚠️ Warning: Weights file not found at {local_path}.")
+                print(f"   MambaGlue will be trained from scratch.")
+                print(f"   To use pretrained weights, download:")
+                print(f"   https://github.com/url-kaist/MambaGlue/releases/download/v0.1/superpoint_mambaglue.tar")
+                state_dict = None
             else:
-                raise KeyError(
-                    "The checkpoint does not contain 'model' key. Available keys are: ",
-                    checkpoint.keys(),
-                )
+                try:
+                    checkpoint = torch.load(str(local_path), map_location="cpu")
 
-            # Load the state dict into your model
-            self.load_state_dict(state_dict, strict=False)
+                    # Extract only the model weights from the checkpoint
+                    if "model" in checkpoint:
+                        state_dict = checkpoint["model"]
+                        print(f"✅ Successfully loaded MambaGlue pretrained weights from {local_path}")
+                    else:
+                        # 如果没有 'model' 键，直接使用整个 checkpoint
+                        state_dict = checkpoint
+                        print(f"✅ Successfully loaded MambaGlue weights from {local_path}")
+                except Exception as e:
+                    print(f"❌ Error loading weights from {local_path}: {e}")
+                    print(f"   MambaGlue will be trained from scratch.")
+                    state_dict = None
         elif conf.weights is not None:
             path = Path(__file__).parent
             path = path / "weights/{}.pth".format(self.conf.weights)
-            state_dict = torch.load(str(path), map_location="cpu")
+            if path.exists():
+                state_dict = torch.load(str(path), map_location="cpu")
+                print(f"✅ Loaded weights from {path}")
+            else:
+                print(f"⚠️ Weights file not found at {path}, training from scratch")
+                state_dict = None
 
         if state_dict:
             # rename mismatched state dict entries
@@ -628,7 +641,18 @@ class MambaGlue(nn.Module):
                 state_dict = {k.replace(*pattern): v for k, v in state_dict.items()}
                 pattern = "extractor", ""
                 state_dict = {k.replace(*pattern): v for k, v in state_dict.items()}
-            self.load_state_dict(state_dict, strict=False)
+            
+            # Load state dict with error handling
+            try:
+                missing_keys, unexpected_keys = self.load_state_dict(state_dict, strict=False)
+                if missing_keys:
+                    print(f"⚠️ Missing keys: {len(missing_keys)} keys")
+                if unexpected_keys:
+                    print(f"⚠️ Unexpected keys: {len(unexpected_keys)} keys")
+                print("✅ MambaGlue weights loaded successfully")
+            except Exception as e:
+                print(f"❌ Error loading state dict: {e}")
+                print("   Continuing with random initialization")
 
         # static lengths MambaGlue is compiled for (only used with torch.compile)
         self.static_lengths = None
@@ -823,6 +847,7 @@ class MambaGlue(nn.Module):
             "scores": mscores,
             "prune0": prune0,
             "prune1": prune1,
+            "log_assignment": scores,  # 添加用于训练的 log_assignment
         }
 
     def confidence_threshold(self, layer_index: int) -> float:
