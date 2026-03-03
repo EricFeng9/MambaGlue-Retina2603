@@ -220,8 +220,33 @@ class SuperPoint(Extractor):
             for k, d in zip(keypoints, descriptors)
         ]
 
+        # Pad keypoints, scores, and descriptors to the same length for batching
+        max_kpts = max(k.shape[0] for k in keypoints)
+        
+        padded_keypoints = []
+        padded_scores = []
+        padded_descriptors = []
+        
+        for k, s, d in zip(keypoints, scores, descriptors):
+            num_kpts = k.shape[0]
+            if num_kpts < max_kpts:
+                # Pad with zeros
+                pad_size = max_kpts - num_kpts
+                k_padded = torch.cat([k, torch.zeros(pad_size, 2, device=k.device)], dim=0)
+                s_padded = torch.cat([s, torch.zeros(pad_size, device=s.device)], dim=0)
+                # d shape: [descriptor_dim, num_kpts], need to pad along dim 1
+                d_padded = torch.cat([d, torch.zeros(d.shape[0], pad_size, device=d.device)], dim=1)
+            else:
+                k_padded = k
+                s_padded = s
+                d_padded = d
+            
+            padded_keypoints.append(k_padded)
+            padded_scores.append(s_padded)
+            padded_descriptors.append(d_padded)
+
         return {
-            "keypoints": torch.stack(keypoints, 0),
-            "keypoint_scores": torch.stack(scores, 0),
-            "descriptors": torch.stack(descriptors, 0).transpose(-1, -2).contiguous(),
+            "keypoints": torch.stack(padded_keypoints, 0),
+            "keypoint_scores": torch.stack(padded_scores, 0),
+            "descriptors": torch.stack(padded_descriptors, 0).transpose(-1, -2).contiguous(),
         }
