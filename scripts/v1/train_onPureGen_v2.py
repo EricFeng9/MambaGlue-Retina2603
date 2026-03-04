@@ -181,12 +181,12 @@ class GenDatasetWrapper(torch.utils.data.Dataset):
         # - image1_gt: 配准后的目标 (使用 image0 作为参考，因为 CF 和原始 FA 应该对齐)
         # - T_0to1: 从 image0 到 image1 的变换
         
-        # 直接使用新数据集的输出，添加 image1_gt 字段
-        # 由于新数据集中 CF 和原始 FA 是对齐的，我们用 image0 作为 image1_gt 的参考
+        # 直接使用新数据集的输出
+        # 数据集已经返回了 image1_gt（原始FA），直接使用
         result = {
             'image0': data['image0'],          # [1, H, W] CF (固定图)
             'image1': data['image1'],          # [1, H, W] FA deformed (未配准的移动图)
-            'image1_gt': data['image0'],       # [1, H, W] 使用 CF 作为配准目标
+            'image1_gt': data.get('image1_gt', data['image1']),  # [1, H, W] 原始FA (配准目标)
             'T_0to1': data['T_0to1'],          # [3, 3] 变换矩阵
             'pair_names': data['pair_names'],
             'dataset_name': data['dataset_name']
@@ -314,9 +314,7 @@ class PL_MambaGlue_Gen(pl.LightningModule):
             
         # 2. 匹配器 (MambaGlue) - 可训练
         mg_conf = config.MATCHING.copy()
-        # 如果不想使用 MambaGlue 内置的权重加载逻辑，设置 features=None
-        # 这样可以从零开始训练，或者手动加载权重
-        mg_conf['features'] = None  # 禁用自动加载，避免找不到 checkpoint_best.tar 报错
+        # 与 train_onReal 保持一致
         self.matcher = MambaGlue(**mg_conf)
         
         # 可选：如果有 MambaGlue 预训练权重，在这里加载
