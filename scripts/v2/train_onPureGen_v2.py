@@ -548,9 +548,9 @@ class PL_MambaGlue_Gen(pl.LightningModule):
         set_metrics_verbose(True)  # 验证时输出详细日志
         compute_homography_errors(metrics_batch, self.config)
 
-        # 【关键修改】累积误差用于 epoch 结束时统一计算 AUC（使用 avg_dist，与测试脚本对齐）
-        if len(metrics_batch.get('avg_dist', [])) > 0:
-            self._val_step_errors.extend(metrics_batch['avg_dist'])
+        # 【关键修改】按照 metrics_cau_principle_0305.md：使用 MACE 计算 AUC
+        if len(metrics_batch.get('auc_error', [])) > 0:
+            self._val_step_errors.extend(metrics_batch['auc_error'])
         
         # 【关键修改】保存 metrics_batch 到实例变量，供 callback 使用
         # metrics.py 已经按照 metrics_cau_principle_0304.md 规范计算了：
@@ -776,10 +776,9 @@ class MultimodalValidationCallback(Callback):
         # 【关键修改】直接从 metrics_batch 获取 MSE 和 MACE，而不是自己计算
         # metrics.py 按照 metrics_cau_principle_0304.md 计算：
         # - mse/mace: 仅包含 Acceptable 样本（mae ≤ 50 且 mee ≤ 20），其他为 inf
-        # - avg_dist: 包含所有样本（Failed 为 1e6，Success 为实际误差）
         mse_list = metrics_batch.get('mse', [])
         mace_list = metrics_batch.get('mace', [])
-        avg_dist_list = metrics_batch.get('avg_dist', [])
+        auc_error_list = metrics_batch.get('auc_error', [])
         
         failed_samples = 0
         inaccurate_samples = 0
@@ -787,10 +786,10 @@ class MultimodalValidationCallback(Callback):
         
         for i in range(batch_size):
             # 判断样本类型（按照 metrics_cau_principle_0304.md）
-            if i < len(avg_dist_list):
-                avg_dist = avg_dist_list[i]
-                # Failed: avg_dist = 1e6
-                if np.isclose(avg_dist, 1e6):
+            if i < len(auc_error_list):
+                auc_error = auc_error_list[i]
+                # Failed: error = 1e6
+                if np.isclose(auc_error, 1e6):
                     failed_samples += 1
                 else:
                     # Success 样本，判断是 Inaccurate 还是 Acceptable

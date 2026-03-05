@@ -255,7 +255,7 @@ def compute_homography_errors(data, config):
     计算单应矩阵估计误差 (针对 MultiModal 数据集)
     完全对齐 metrics_cau_principle_0304.md 的指标计算原则
     """
-    data.update({'R_errs': [], 't_errs': [], 'inliers': [], 'H_est': [], 'mse': [], 'mace': [], 'avg_dist': []})
+    data.update({'R_errs': [], 't_errs': [], 'inliers': [], 'H_est': [], 'mse': [], 'mace': [], 'avg_dist': [], 'auc_error': []})
 
     m_bids = data['m_bids'].cpu().numpy() if torch.is_tensor(data['m_bids']) else data['m_bids']
     pts0 = data['mkpts0_f'].cpu().numpy() if torch.is_tensor(data['mkpts0_f']) else data['mkpts0_f']
@@ -368,9 +368,11 @@ def compute_homography_errors(data, config):
 
         # AUC 相关：累积所有样本的误差
         if is_failed:
-            data['avg_dist'].append(1e6)  # Failed 样本
+            data['avg_dist'].append(1e6)  # 仅起占位作用
+            data['auc_error'].append(1e6) # Failed 样本: error = 1e6
         else:
-            data['avg_dist'].append(avg_dist)  # Success 样本（包括 inaccurate）
+            data['avg_dist'].append(avg_dist)
+            data['auc_error'].append(mace) # Success 样本（包括 inaccurate）: error = mace
 
         # MSE/MACE：仅统计 Acceptable 样本（mae ≤ 50 且 mee ≤ 20）
         if is_failed or is_inaccurate:
