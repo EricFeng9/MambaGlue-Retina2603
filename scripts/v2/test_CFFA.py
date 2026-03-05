@@ -351,8 +351,8 @@ class PL_MambaGlue(pl.LightningModule):
         while len(H_ests) < B:
             H_ests.append(np.eye(3))  # 填充单位矩阵
 
-        if len(metrics_batch.get('avg_dist', [])) > 0:
-            self._test_step_errors.extend(metrics_batch['avg_dist'])
+        if len(metrics_batch.get('auc_error', [])) > 0:
+            self._test_step_errors.extend(metrics_batch['auc_error'])
 
         if len(metrics_batch.get('mse', [])) > 0:
             for m in metrics_batch['mse']:
@@ -505,19 +505,19 @@ class TestCallback(Callback):
         # metrics.py 中：
         # - Failed: avg_dist = 1e6
         # - Success (包括 inaccurate): avg_dist = 实际计算的 avg_dist
-        avg_dist_list = metrics_batch.get('avg_dist', [])
         mse_list = metrics_batch.get('mse', [])
         mace_list = metrics_batch.get('mace', [])
+        auc_error_list = metrics_batch.get('auc_error', [])
 
         for i in range(batch_size):
             self.total_samples += 1
 
             # 直接使用 metrics.py 的判断结果
-            if i < len(avg_dist_list):
-                avg_dist = avg_dist_list[i]
+            if i < len(auc_error_list):
+                auc_error = auc_error_list[i]
 
-                # Failed 判断: avg_dist = 1e6 (在 metrics.py 中设置的)
-                if np.isclose(avg_dist, 1e6):
+                # Failed 判断: error = 1e6 (在 metrics.py 中设置的)
+                if np.isclose(auc_error, 1e6):
                     self.failed_samples += 1
                 else:
                     # Success 样本，判断是 Inaccurate 还是 Acceptable
