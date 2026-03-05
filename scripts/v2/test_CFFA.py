@@ -14,21 +14,20 @@ import torch
 import pytorch_lightning as pl
 from pytorch_lightning.utilities import rank_zero_only
 from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, Callback, EarlyStopping
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, Callback
 from pytorch_lightning.strategies import DDPStrategy
 import logging
 from types import SimpleNamespace
 
-# 添加父目录到 sys.path
+# 添加父目录到 sys.path 以支持导入
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
 # 导入 MambaGlue 相关模块
 from mambaglue import MambaGlue, SuperPoint
 from mambaglue import viz2d
 
-# 导入数据集
-from data.operation_pre_filtered_cffa.operation_pre_filtered_cffa_dataset import CFFADataset as TrainCFFADataset
-from data.operation_pre_filtered_cffa.operation_pre_filtered_cffa_dataset import CFFADataset as ValCFFADataset
+# 导入 CFFA 数据集（使用新的 cffa_dataset.py）
+from data.CFFA.cffa_dataset import CFFADataset
 
 # 导入指标计算模块（v2版本，对齐 metrics_cau_principle_0304.md）
 from scripts.v2.metrics import (
@@ -43,6 +42,7 @@ from scripts.v2.metrics import (
 # 配置函数
 # ==========================================
 def get_default_config():
+    """获取默认配置"""
     conf = SimpleNamespace()
     conf.TRAINER = SimpleNamespace()
     conf.TRAINER.CANONICAL_BS = 4
@@ -53,7 +53,7 @@ def get_default_config():
     conf.TRAINER.WORLD_SIZE = 1
     conf.TRAINER.TRUE_BATCH_SIZE = 4
     conf.TRAINER.PLOT_MODE = 'evaluation'
-    
+
     conf.MATCHING = {
         'features': 'superpoint',
         'input_dim': 256,
@@ -68,20 +68,8 @@ def get_default_config():
 # ==========================================
 # 工具函数
 # ==========================================
-def is_valid_homography(H, scale_min=0.1, scale_max=10.0, perspective_threshold=0.005):
-    if H is None:
-        return False
-    if np.isnan(H).any() or np.isinf(H).any():
-        return False
-    det = np.linalg.det(H[:2, :2])
-    if det < scale_min or det > scale_max:
-        return False
-    if abs(H[2, 0]) > perspective_threshold or abs(H[2, 1]) > perspective_threshold:
-        return False
-    return True
-
 def filter_valid_area(img1, img2):
-    assert img1.shape[:2] == img2.shape[:2]
+    assert img1.shape[:2] == img2.shape[:2], "两张图片的尺寸必须一致"
     if len(img1.shape) == 3:
         mask1 = np.any(img1 > 10, axis=2)
     else:
@@ -134,46 +122,46 @@ def create_chessboard(img1, img2, grid_size=4):
     return chessboard
 
 # ==========================================
-# 数据集包装类
+# 辅助类: RealDatasetWrapper
 # ==========================================
 class RealDatasetWrapper(torch.utils.data.Dataset):
     def __init__(self, base_dataset):
         self.base_dataset = base_dataset
-        
+
     def __len__(self):
         return len(self.base_dataset)
-    
+
     def __getitem__(self, idx):
         fix_tensor, moving_original_tensor, moving_gt_tensor, fix_path, moving_path, T_0to1 = self.base_dataset[idx]
         moving_original_tensor = (moving_original_tensor + 1) / 2
         moving_gt_tensor = (moving_gt_tensor + 1) / 2
-        
+
         if fix_tensor.shape[0] == 3:
             fix_gray = 0.299 * fix_tensor[0] + 0.587 * fix_tensor[1] + 0.114 * fix_tensor[2]
             fix_gray = fix_gray.unsqueeze(0)
         else:
             fix_gray = fix_tensor
-            
+
         if moving_gt_tensor.shape[0] == 3:
             moving_gray = 0.299 * moving_gt_tensor[0] + 0.587 * moving_gt_tensor[1] + 0.114 * moving_gt_tensor[2]
             moving_gray = moving_gray.unsqueeze(0)
         else:
             moving_gray = moving_gt_tensor
-            
+
         if moving_original_tensor.shape[0] == 3:
             moving_orig_gray = 0.299 * moving_original_tensor[0] + 0.587 * moving_original_tensor[1] + 0.114 * moving_original_tensor[2]
             moving_orig_gray = moving_orig_gray.unsqueeze(0)
         else:
             moving_orig_gray = moving_original_tensor
-        
+
         fix_name = os.path.basename(fix_path)
         moving_name = os.path.basename(moving_path)
-        
+
         try:
             T_fix_to_moving = torch.inverse(T_0to1)
         except:
             T_fix_to_moving = T_0to1
-            
+
         return {
             'image0': fix_gray,
             'image1': moving_orig_gray,
@@ -195,38 +183,30 @@ class MultimodalDataModule(pl.LightningDataModule):
         }
 
     def setup(self, stage=None):
-        if stage == 'fit' or stage is None:
-            script_dir = Path(__file__).parent.parent.parent
-            
-            # 训练集：使用 operation_pre_filtered_cffa 真实数据
-            train_data_dir = script_dir / 'data' / 'operation_pre_filtered_cffa'
-            train_base = TrainCFFADataset(root_dir=str(train_data_dir), split='train', mode='cf2fa')
-            self.train_dataset = RealDatasetWrapper(train_base)
-            
-            # 验证集：使用 operation_pre_filtered_cffa 真实数据
-            val_data_dir = script_dir / 'data' / 'operation_pre_filtered_cffa'
-            val_base = ValCFFADataset(root_dir=str(val_data_dir), split='val', mode='cf2fa')
-            self.val_dataset = RealDatasetWrapper(val_base)
+        script_dir = Path(__file__).parent.parent.parent
 
-    def train_dataloader(self):
-        return torch.utils.data.DataLoader(self.train_dataset, shuffle=True, **self.loader_params)
+        # 【修改】统一使用 'all' 模式，合并训练集和验证集
+        # 这样不管是什么训练模式（gen/real），都统一在 CFFA 的全量数据上测试
+        test_data_dir = script_dir / 'data' / 'CFFA'
+        test_base = CFFADataset(root_dir=str(test_data_dir), split='all', mode='cf2fa')
+        self.test_dataset = RealDatasetWrapper(test_base)
 
-    def val_dataloader(self):
-        return torch.utils.data.DataLoader(self.val_dataset, shuffle=False, **self.loader_params)
+        logger.info(f"CFFA 全量数据集: {len(self.test_dataset)} 样本")
+
+    def test_dataloader(self):
+        return torch.utils.data.DataLoader(self.test_dataset, shuffle=False, **self.loader_params)
 
 # ==========================================
-# 模型类: PL_MambaGlue_Real
+# 核心模型: PL_MambaGlue
 # ==========================================
-class PL_MambaGlue_Real(pl.LightningModule):
+class PL_MambaGlue(pl.LightningModule):
     def __init__(self, config, result_dir=None):
         super().__init__()
         self.config = config
         self.result_dir = result_dir
         self.save_hyperparameters({'config': str(config)})
-        
-        # 1. 特征提取器 (SuperPoint) - 冻结，加载预训练权重
+
         self.extractor = SuperPoint(max_num_keypoints=2048).eval()
-        # 加载 SuperPoint 预训练权重
         sp_url = "https://github.com/cvg/LightGlue/releases/download/v0.1_arxiv/superpoint_v1.pth"
         try:
             sp_state = torch.hub.load_state_dict_from_url(sp_url, map_location='cpu')
@@ -234,23 +214,21 @@ class PL_MambaGlue_Real(pl.LightningModule):
             logger.info("成功加载 SuperPoint 预训练权重")
         except Exception as e:
             logger.warning(f"加载 SuperPoint 预训练权重失败: {e}，使用随机初始化")
-        
+
         for param in self.extractor.parameters():
             param.requires_grad = False
-            
-        # 2. 匹配器 (MambaGlue) - 可训练
+
         mg_conf = config.MATCHING.copy()
         self.matcher = MambaGlue(**mg_conf)
-        
+
         self.force_viz = False
-        
-        # 用于跨 batch 累积 AUC，在 on_validation_epoch_end 中聚合
-        self._val_step_aucs = []  # list of (auc5, auc10, auc20)
+        self._test_step_errors = []
+        self._test_step_mse = []
+        self._test_step_mace = []
 
     def configure_optimizers(self):
         lr = self.config.TRAINER.TRUE_LR
         optimizer = torch.optim.Adam(self.matcher.parameters(), lr=lr)
-        
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode='max', factor=0.5, patience=10, verbose=True
         )
@@ -259,7 +237,6 @@ class PL_MambaGlue_Real(pl.LightningModule):
             "lr_scheduler": {
                 "scheduler": scheduler,
                 "monitor": "combined_auc",
-                "strict": False,
             },
         }
 
@@ -269,14 +246,14 @@ class PL_MambaGlue_Real(pl.LightningModule):
                 feats0 = self.extractor({'image': batch['image0']})
                 feats1 = self.extractor({'image': batch['image1']})
                 batch.update({
-                    'keypoints0': feats0['keypoints'], 
-                    'descriptors0': feats0['descriptors'], 
+                    'keypoints0': feats0['keypoints'],
+                    'descriptors0': feats0['descriptors'],
                     'scores0': feats0['keypoint_scores'],
-                    'keypoints1': feats1['keypoints'], 
-                    'descriptors1': feats1['descriptors'], 
+                    'keypoints1': feats1['keypoints'],
+                    'descriptors1': feats1['descriptors'],
                     'scores1': feats1['keypoint_scores']
                 })
-        
+
         data = {
             'image0': {
                 'keypoints': batch['keypoints0'],
@@ -289,77 +266,60 @@ class PL_MambaGlue_Real(pl.LightningModule):
                 'image': batch['image1']
             }
         }
-        
         return self.matcher(data)
 
     def _compute_gt_matches(self, kpts0, kpts1, T_0to1, dist_th=3.0):
         B, M, _ = kpts0.shape
         B, N, _ = kpts1.shape
         device = kpts0.device
-        
         kpts0_h = torch.cat([kpts0, torch.ones(B, M, 1, device=device)], dim=-1)
         kpts0_warped_h = torch.matmul(kpts0_h, T_0to1.transpose(1, 2))
         kpts0_warped = kpts0_warped_h[..., :2] / (kpts0_warped_h[..., 2:] + 1e-8)
-        
         dist = torch.cdist(kpts0_warped, kpts1)
         min_dist, matched_indices = torch.min(dist, dim=-1)
         mask = min_dist < dist_th
         matches_gt = torch.where(mask, matched_indices, torch.tensor(-1, device=device))
-        
         return matches_gt
 
     def _compute_loss(self, outputs, kpts0, kpts1, T_0to1):
         scores = outputs['log_assignment']
         matches_gt = self._compute_gt_matches(kpts0, kpts1, T_0to1)
-        
         B, M, N = scores.shape[0], scores.shape[1]-1, scores.shape[2]-1
-        
         targets = matches_gt.clone()
         targets[targets == -1] = N
-        
         target_log_probs = torch.gather(scores[:, :M, :], 2, targets.unsqueeze(2)).squeeze(2)
         loss = -target_log_probs.mean()
-        
         return loss
 
-    def training_step(self, batch, batch_idx):
+    def test_step(self, batch, batch_idx):
         outputs = self(batch)
         loss = self._compute_loss(outputs, batch['keypoints0'], batch['keypoints1'], batch['T_0to1'])
-        
-        self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True)
-        return loss
+        self.log('test_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
 
-    def validation_step(self, batch, batch_idx, dataloader_idx=0):
-        outputs = self(batch)
-        
-        loss = self._compute_loss(outputs, batch['keypoints0'], batch['keypoints1'], batch['T_0to1'])
-        self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
-        
         matches0 = outputs['matches0']
         kpts0 = batch['keypoints0']
         kpts1 = batch['keypoints1']
-        
+
         B = kpts0.shape[0]
         H_ests = []
-        
         mkpts0_f_list = []
         mkpts1_f_list = []
         m_bids_list = []
-        
+
         for b in range(B):
             m0 = matches0[b]
             valid = m0 > -1
             m_indices_0 = torch.where(valid)[0]
             m_indices_1 = m0[valid]
-            
+
             pts0 = kpts0[b][m_indices_0].cpu().numpy()
             pts1 = kpts1[b][m_indices_1].cpu().numpy()
-            
+
             if len(pts0) > 0:
                 mkpts0_f_list.append(torch.from_numpy(pts0).float())
                 mkpts1_f_list.append(torch.from_numpy(pts1).float())
                 m_bids_list.append(torch.full((len(pts0),), b, dtype=torch.long))
-            
+
             if len(pts0) >= 4:
                 try:
                     H, _ = cv2.findHomography(pts0, pts1, cv2.RANSAC, self.config.TRAINER.RANSAC_PIXEL_THR)
@@ -370,7 +330,7 @@ class PL_MambaGlue_Real(pl.LightningModule):
             else:
                 H = np.eye(3)
             H_ests.append(H)
-        
+
         metrics_batch = {
             'mkpts0_f': torch.cat(mkpts0_f_list, dim=0) if mkpts0_f_list else torch.empty(0, 2),
             'mkpts1_f': torch.cat(mkpts1_f_list, dim=0) if mkpts1_f_list else torch.empty(0, 2),
@@ -379,297 +339,245 @@ class PL_MambaGlue_Real(pl.LightningModule):
             'image0': batch['image0'],
             'dataset_name': batch['dataset_name']
         }
-        
+
         set_metrics_verbose(True)
         compute_homography_errors(metrics_batch, self.config)
 
-        # 【关键修改】累积误差用于 epoch 结束时统一计算 AUC（使用 avg_dist，与测试脚本对齐）
+        # 直接使用 metrics.py 返回的 H_est（经过 Spatial Binning）
+        # 注意：metrics.py 中当 num_matches < 4 时会跳过，所以长度可能不够
+        H_ests_raw = metrics_batch.get('H_est', [])
+        # 确保 H_ests 长度与 batch size 一致
+        H_ests = list(H_ests_raw)
+        while len(H_ests) < B:
+            H_ests.append(np.eye(3))  # 填充单位矩阵
+
         if len(metrics_batch.get('avg_dist', [])) > 0:
-            self._val_step_errors.extend(metrics_batch['avg_dist'])
-        
-        # 【关键修改】保存 metrics_batch 到实例变量，供 callback 使用
-        self._last_val_metrics = metrics_batch
-        
-        # 保存到实例变量供 callback 使用，不返回避免 Lightning 自动收集
-        self._last_val_outputs = {
+            self._test_step_errors.extend(metrics_batch['avg_dist'])
+
+        if len(metrics_batch.get('mse', [])) > 0:
+            for m in metrics_batch['mse']:
+                if not np.isinf(m):
+                    self._test_step_mse.append(m)
+        if len(metrics_batch.get('mace', [])) > 0:
+            for m in metrics_batch['mace']:
+                if not np.isinf(m):
+                    self._test_step_mace.append(m)
+
+        return {
             'H_est': H_ests,
             'kpts0': kpts0,
             'kpts1': kpts1,
-            'matches0': matches0
+            'matches0': matches0,
+            'metrics_batch': metrics_batch
         }
-        
-        return None
 
-    def on_validation_epoch_start(self):
-        """每个验证 epoch 开始时重置误差累积列表"""
-        self._val_step_errors = []
+    def on_test_epoch_start(self):
+        self._test_step_errors = []
+        self._test_step_mse = []
+        self._test_step_mace = []
 
-    def on_validation_epoch_end(self):
-        """在模型自身 hook 中 log combined_auc，确保 EarlyStopping 能找到该指标"""
-        if self._val_step_errors and len(self._val_step_errors) > 0:
-            # 使用 metrics.py 的 error_auc 函数计算 AUC@5, AUC@10, AUC@20
-            # 【关键修改】对所有误差一起计算 AUC，而不是对每个 batch 分别计算后取平均
-            from scripts.v2.metrics import error_auc, compute_auc_rop
-            auc_dict = error_auc(self._val_step_errors, [5, 10, 20])
-            auc5_mean = auc_dict.get('auc@5', 0.0)
-            auc10_mean = auc_dict.get('auc@10', 0.0)
-            auc20_mean = auc_dict.get('auc@20', 0.0)
-            
-            # 计算 mAUC
-            mauc_dict = compute_auc_rop(self._val_step_errors, limit=25)
+    def on_test_epoch_end(self):
+        if self._test_step_errors and len(self._test_step_errors) > 0:
+            auc_dict = error_auc(self._test_step_errors, [5, 10, 20])
+            auc5 = auc_dict.get('auc@5', 0.0)
+            auc10 = auc_dict.get('auc@10', 0.0)
+            auc20 = auc_dict.get('auc@20', 0.0)
+            mauc_dict = compute_auc_rop(self._test_step_errors, limit=25)
             mauc = mauc_dict.get('mAUC', 0.0)
         else:
-            auc5_mean = auc10_mean = auc20_mean = mauc = 0.0
-        combined_auc = (auc5_mean + auc10_mean + auc20_mean) / 3.0
-        # 在模型 hook 里 log，EarlyStopping（运行于之后的 on_validation_end）一定能读到
-        self.log('auc@5',        auc5_mean,    on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
-        self.log('auc@10',       auc10_mean,   on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
-        self.log('auc@20',       auc20_mean,   on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+            auc5 = auc10 = auc20 = mauc = 0.0
+
+        combined_auc = (auc5 + auc10 + auc20) / 3.0
+        
+        # 【修复】当没有 Acceptable 样本时，应该返回 NaN 而不是 0
+        # 因为 0 会误导用户以为计算成功了
+        avg_mse = np.mean(self._test_step_mse) if self._test_step_mse else float('nan')
+        avg_mace = np.mean(self._test_step_mace) if self._test_step_mace else float('nan')
+
+        self.log('auc@5',        auc5,         on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+        self.log('auc@10',       auc10,        on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+        self.log('auc@20',       auc20,        on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
         self.log('mAUC',         mauc,         on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
         self.log('combined_auc', combined_auc, on_epoch=True, prog_bar=True,  logger=True, sync_dist=False)
+        self.log('mse', avg_mse, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+        self.log('mace', avg_mace, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
 
 # ==========================================
-# 回调类: MultimodalValidationCallback
+# 回调逻辑: TestCallback
 # ==========================================
-class MultimodalValidationCallback(Callback):
-    def __init__(self, args):
+class TestCallback(Callback):
+    def __init__(self, args, output_dir):
         super().__init__()
         self.args = args
-        self.best_val = -1.0
-        self.result_dir = Path(f"results/mambaglue_{args.mode}/{args.name}")
-        self.result_dir.mkdir(parents=True, exist_ok=True)
-        self.epoch_mses = []
-        self.epoch_maces = []
+        self.output_dir = output_dir
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.total_samples = 0
+        self.failed_samples = 0
+        self.inaccurate_samples = 0
+        self.acceptable_samples = 0
 
         import csv
-        self.csv_path = self.result_dir / "metrics.csv"
-        if not self.csv_path.exists():
-            with open(self.csv_path, "w", newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(["Epoch", "Train Loss", "Val Loss", "Val MSE", "Val MACE", "Val AUC@5", "Val AUC@10", "Val AUC@20", "Val Combined AUC", "Val Inverse MACE"])
-        
-        self.current_train_metrics = {}
-        self.current_val_metrics = {}
+        self.csv_path = self.output_dir / "test_metrics.csv"
+        with open(self.csv_path, "w", newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(["Batch", "Test Loss", "MSE", "MACE", "AUC@5", "AUC@10", "AUC@20", "mAUC", "Failed", "Inaccurate", "Acceptable"])
 
-    def _try_write_csv(self, epoch):
-        if epoch in self.current_train_metrics and epoch in self.current_val_metrics:
-            t = self.current_train_metrics.pop(epoch)
-            v = self.current_val_metrics.pop(epoch)
-            import csv
-            with open(self.csv_path, "a", newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    epoch,
-                    t.get('loss', ''),
-                    v.get('val_loss', ''),
-                    v['mse'],
-                    v['mace'],
-                    v['auc5'],
-                    v['auc10'],
-                    v['auc20'],
-                    v['combined_auc'],
-                    v['inverse_mace']
-                ])
+    def on_test_epoch_start(self, trainer, pl_module):
+        self.total_samples = 0
+        self.failed_samples = 0
+        self.inaccurate_samples = 0
+        self.acceptable_samples = 0
 
-    def on_validation_epoch_start(self, trainer, pl_module):
-        self.epoch_mses = []
-        self.epoch_maces = []
+    def on_test_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
+        self._process_batch(trainer, pl_module, batch, outputs, batch_idx, save_images=True)
 
-    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
-        # 从实例变量读取输出，因为 validation_step 返回 None
-        outputs = pl_module._last_val_outputs if hasattr(pl_module, '_last_val_outputs') else {}
-        # 从实例变量读取 metrics.py 计算的结果
-        metrics_batch = pl_module._last_val_metrics if hasattr(pl_module, '_last_val_metrics') else {}
-        batch_mses, batch_maces = self._process_batch(trainer, pl_module, batch, outputs, metrics_batch, None, save_images=False)
-        self.epoch_mses.extend(batch_mses)
-        self.epoch_maces.extend(batch_maces)
-
-    def on_train_epoch_end(self, trainer, pl_module):
-        epoch = trainer.current_epoch + 1
-        metrics = trainer.callback_metrics
-        display_metrics = {}
-        
-        if 'train/loss_epoch' in metrics:
-            display_metrics['loss'] = metrics['train/loss_epoch'].item()
-        
-        if display_metrics:
-            metric_str = " | ".join([f"{k}: {v:.4f}" for k, v in display_metrics.items()])
-            logger.info(f"Epoch {epoch} 训练总结 >> {metric_str}")
-        
-        self.current_train_metrics[epoch] = display_metrics
-        self._try_write_csv(epoch)
-
-    def on_validation_epoch_end(self, trainer, pl_module):
-        if not self.epoch_mses:
+    def on_test_epoch_end(self, trainer, pl_module):
+        if self.total_samples == 0:
+            logger.warning("没有收集到任何测试指标")
             return
-        
-        # 只在匹配成功的样本上计算 MSE 和 MACE（与测试脚本保持一致）
-        avg_mse = sum(self.epoch_mses) / len(self.epoch_mses) if self.epoch_mses else 0.0
-        avg_mace = sum(self.epoch_maces) / len(self.epoch_maces) if self.epoch_maces else 0.0
-        
-        epoch = trainer.current_epoch + 1
+
         metrics = trainer.callback_metrics
-        
-        display_metrics = {'mse': avg_mse, 'mace': avg_mace}
-        
-        # combined_auc 已由模型的 on_validation_epoch_end 先行 log，这里直接读取
-        for k in ['auc@5', 'auc@10', 'auc@20', 'combined_auc']:
-            if k in metrics:
-                display_metrics[k] = metrics[k].item()
-            else:
-                display_metrics[k] = 0.0
-        
-        if 'val_loss' in metrics:
-            display_metrics['val_loss'] = metrics['val_loss'].item()
-        
-        auc5        = display_metrics.get('auc@5', 0.0)
-        auc10       = display_metrics.get('auc@10', 0.0)
-        auc20       = display_metrics.get('auc@20', 0.0)
-        combined_auc = display_metrics.get('combined_auc', 0.0)
-        inverse_mace = 1.0 / (1.0 + avg_mace) if avg_mace > 0 else 1.0
-        
-        # 仅在回调中 log 不涉及早停监控的辅助指标
-        pl_module.log("val_mse",      avg_mse,      on_epoch=True, prog_bar=False, logger=True)
-        pl_module.log("val_mace",     avg_mace,     on_epoch=True, prog_bar=False, logger=True)
-        pl_module.log("inverse_mace", inverse_mace, on_epoch=True, prog_bar=False, logger=True)
-        
-        metric_str = " | ".join([f"{k}: {v:.4f}" for k, v in display_metrics.items()])
-        logger.info(f"Epoch {epoch} 验证总结 >> {metric_str} | combined_auc: {combined_auc:.4f} | inverse_mace: {inverse_mace:.6f}")
-        
-        self.current_val_metrics[epoch] = {
-            'mse': avg_mse,
-            'mace': avg_mace,
-            'auc5': auc5,
-            'auc10': auc10,
-            'auc20': auc20,
-            'combined_auc': combined_auc,
-            'inverse_mace': inverse_mace,
-            'val_loss': display_metrics.get('val_loss', 0.0)
-        }
-        self._try_write_csv(epoch)
-        
-        latest_path = self.result_dir / "latest_checkpoint"
-        latest_path.mkdir(exist_ok=True)
-        trainer.save_checkpoint(latest_path / "model.ckpt")
+
+        if hasattr(pl_module, '_test_step_errors') and pl_module._test_step_errors:
+            errors = pl_module._test_step_errors
+            auc_dict = error_auc(errors, [5, 10, 20])
+            auc5 = auc_dict.get('auc@5', 0.0)
+            auc10 = auc_dict.get('auc@10', 0.0)
+            auc20 = auc_dict.get('auc@20', 0.0)
+            mauc_dict = compute_auc_rop(errors, limit=25)
+            mauc = mauc_dict.get('mAUC', 0.0)
+        else:
+            auc5 = auc10 = auc20 = mauc = 0.0
+
+        combined_auc = (auc5 + auc10 + auc20) / 3.0
+
+        # 从 metrics 中获取 MSE 和 MACE
+        # 注意：如果没有 Acceptable 样本，PL_MambaGlue 会返回 NaN
+        avg_mse = metrics.get('mse', 0.0)
+        if hasattr(avg_mse, 'item'):
+            avg_mse = avg_mse.item()
+        # 如果是 0 但没有 Acceptable 样本，可能是没有数据，此时显示为 NaN 更合理
+        if avg_mse == 0.0 and not hasattr(pl_module, '_test_step_mse'):
+            avg_mse = float('nan')
             
-        is_best = False
-        if combined_auc > self.best_val:
-            self.best_val = combined_auc
-            is_best = True
-            best_path = self.result_dir / "best_checkpoint"
-            best_path.mkdir(exist_ok=True)
-            trainer.save_checkpoint(best_path / "model.ckpt")
-            with open(best_path / "log.txt", "w") as f:
-                f.write(f"Epoch: {epoch}\nBest Combined AUC: {combined_auc:.4f}\n")
-                f.write(f"AUC@5: {auc5:.4f}\nAUC@10: {auc10:.4f}\nAUC@20: {auc20:.4f}\n")
-                f.write(f"MACE: {avg_mace:.4f}\nMSE: {avg_mse:.6f}\n")
-            logger.info(f"发现新的最优模型! Epoch {epoch}, Combined AUC: {combined_auc:.4f}")
+        avg_mace = metrics.get('mace', 0.0)
+        if hasattr(avg_mace, 'item'):
+            avg_mace = avg_mace.item()
+        if avg_mace == 0.0 and not hasattr(pl_module, '_test_step_mace'):
+            avg_mace = float('nan')
 
-        if is_best or (epoch % 5 == 0):
-            self._trigger_visualization(trainer, pl_module, is_best, epoch)
+        match_failure_rate = self.failed_samples / self.total_samples if self.total_samples > 0 else 0.0
 
-    def _trigger_visualization(self, trainer, pl_module, is_best, epoch):
-        pl_module.force_viz = True
-        target_dir = self.result_dir / (f"epoch{epoch}_best" if is_best else f"epoch{epoch}")
-        target_dir.mkdir(parents=True, exist_ok=True)
-        
-        val_dataloader = trainer.val_dataloaders[0] if isinstance(trainer.val_dataloaders, list) else trainer.val_dataloaders
-        pl_module.eval()
-        with torch.no_grad():
-            for batch_idx, batch in enumerate(val_dataloader):
-                if batch_idx > 5:
-                    break
-                batch = {k: v.to(pl_module.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-                pl_module.validation_step(batch, batch_idx)
-                # 从实例变量读取输出
-                outputs = pl_module._last_val_outputs if hasattr(pl_module, '_last_val_outputs') else {}
-                metrics_batch = pl_module._last_val_metrics if hasattr(pl_module, '_last_val_metrics') else {}
-                self._process_batch(trainer, pl_module, batch, outputs, metrics_batch, target_dir, save_images=True)
-        pl_module.force_viz = False
+        metric_str = f"mse: {avg_mse:.4f} | mace: {avg_mace:.4f} | auc@5: {auc5:.4f} | auc@10: {auc10:.4f} | auc@20: {auc20:.4f} | mAUC: {mauc:.4f} | combined_auc: {combined_auc:.4f}"
+        logger.info(f"测试总结 >> {metric_str}")
+        logger.info(f"总样本数: {self.total_samples}, 失败: {self.failed_samples}, 不准确: {self.inaccurate_samples}, 可接受: {self.acceptable_samples}")
 
-    def _process_batch(self, trainer, pl_module, batch, outputs, metrics_batch, epoch_dir, save_images=False):
+        summary_path = self.output_dir / "test_summary.txt"
+        with open(summary_path, "w") as f:
+            f.write(f"测试总结\n")
+            f.write(f"=" * 50 + "\n")
+            f.write(f"测试损失: {metrics.get('test_loss', 0.0):.6f}\n")
+            f.write(f"总样本数: {self.total_samples}\n")
+            f.write(f"失败样本数: {self.failed_samples}\n")
+            f.write(f"不准确样本数: {self.inaccurate_samples}\n")
+            f.write(f"可接受样本数: {self.acceptable_samples}\n")
+            f.write(f"匹配失败率: {match_failure_rate:.4f}\n")
+            f.write(f"MSE (仅Acceptable): {avg_mse:.6f}\n")
+            f.write(f"MACE (仅Acceptable): {avg_mace:.4f}\n")
+            f.write(f"AUC@5: {auc5:.4f}\n")
+            f.write(f"AUC@10: {auc10:.4f}\n")
+            f.write(f"AUC@20: {auc20:.4f}\n")
+            f.write(f"mAUC: {mauc:.4f}\n")
+            f.write(f"Combined AUC: {combined_auc:.4f}\n")
+
+        logger.info(f"测试总结已保存到: {summary_path}")
+
+    def _process_batch(self, trainer, pl_module, batch, outputs, batch_idx, save_images=False):
         """
         处理测试批次，直接使用 metrics.py 的计算结果
         严格按照 metrics_cau_principle_0304.md 的逻辑进行统计
-        
-        Args:
-            metrics_batch: metrics.py 返回的字典，包含 mse, mace, avg_dist 等
         """
         batch_size = batch['image0'].shape[0]
         H_ests = outputs.get('H_est', [np.eye(3)] * batch_size)
-        
-        # 【关键修改】直接从 metrics_batch 获取 MSE 和 MACE，而不是自己计算
-        # metrics.py 按照 metrics_cau_principle_0304.md 计算：
-        # - mse/mace: 仅包含 Acceptable 样本（mae ≤ 50 且 mee ≤ 20），其他为 inf
-        # - avg_dist: 包含所有样本（Failed 为 1e6，Success 为实际误差）
+        metrics_batch = outputs.get('metrics_batch', {})
+
+        # 直接使用 metrics.py 计算的 avg_dist 来判断 failed/inaccurate
+        # metrics.py 中：
+        # - Failed: avg_dist = 1e6
+        # - Success (包括 inaccurate): avg_dist = 实际计算的 avg_dist
+        avg_dist_list = metrics_batch.get('avg_dist', [])
         mse_list = metrics_batch.get('mse', [])
         mace_list = metrics_batch.get('mace', [])
-        avg_dist_list = metrics_batch.get('avg_dist', [])
-        
-        failed_samples = 0
-        inaccurate_samples = 0
-        acceptable_samples = 0
-        
+
         for i in range(batch_size):
-            # 判断样本类型（按照 metrics_cau_principle_0304.md）
+            self.total_samples += 1
+
+            # 直接使用 metrics.py 的判断结果
             if i < len(avg_dist_list):
                 avg_dist = avg_dist_list[i]
-                # Failed: avg_dist = 1e6
+
+                # Failed 判断: avg_dist = 1e6 (在 metrics.py 中设置的)
                 if np.isclose(avg_dist, 1e6):
-                    failed_samples += 1
+                    self.failed_samples += 1
                 else:
                     # Success 样本，判断是 Inaccurate 还是 Acceptable
                     if i < len(mse_list) and np.isinf(mse_list[i]):
-                        inaccurate_samples += 1
+                        # mse = inf 表示 Inaccurate (mae > 50 或 mee > 20)
+                        self.inaccurate_samples += 1
                     else:
-                        acceptable_samples += 1
-            
+                        self.acceptable_samples += 1
+            else:
+                # 如果没有 metrics 结果，保守起见计为 failed
+                self.failed_samples += 1
+
             # 后续代码保持不变，用于可视化
             H_est = H_ests[i]
-            
+
             img0 = (batch['image0'][i, 0].cpu().numpy() * 255).astype(np.uint8)
             img1 = (batch['image1'][i, 0].cpu().numpy() * 255).astype(np.uint8)
             img1_gt = (batch['image1_gt'][i, 0].cpu().numpy() * 255).astype(np.uint8)
-            
+
             h, w = img0.shape
             try:
                 H_inv = np.linalg.inv(H_est)
                 img1_result = cv2.warpPerspective(img1, H_inv, (w, h))
             except:
                 img1_result = img1.copy()
-            
+
             if save_images:
-                sample_name = f"{Path(batch['pair_names'][0][i]).stem}_vs_{Path(batch['pair_names'][1][i]).stem}"
-                save_path = epoch_dir / sample_name
+                sample_name = f"batch{batch_idx:04d}_sample{i:02d}_{Path(batch['pair_names'][0][i]).stem}_vs_{Path(batch['pair_names'][1][i]).stem}"
+                save_path = self.output_dir / sample_name
                 save_path.mkdir(parents=True, exist_ok=True)
                 cv2.imwrite(str(save_path / "fix.png"), img0)
+                cv2.imwrite(str(save_path / "moving_original.png"), img1)
                 cv2.imwrite(str(save_path / "moving_result.png"), img1_result)
-                
+                cv2.imwrite(str(save_path / "moving_gt.png"), img1_gt)
+
                 img0_color = cv2.cvtColor(img0, cv2.COLOR_GRAY2BGR)
                 img1_color = cv2.cvtColor(img1, cv2.COLOR_GRAY2BGR)
-                
+
                 if 'kpts0' in outputs and 'kpts1' in outputs:
                     kpts0_np = outputs['kpts0'][i].cpu().numpy()
                     kpts1_np = outputs['kpts1'][i].cpu().numpy()
-                    
+
                     for pt in kpts0_np:
                         cv2.circle(img0_color, (int(pt[0]), int(pt[1])), 2, (255, 255, 255), -1)
                     for pt in kpts1_np:
                         cv2.circle(img1_color, (int(pt[0]), int(pt[1])), 2, (255, 255, 255), -1)
-                    
+
                     if 'matches0' in outputs:
                         m0 = outputs['matches0'][i].cpu()
                         valid = m0 > -1
                         m_indices_0 = torch.where(valid)[0].numpy()
                         m_indices_1 = m0[valid].numpy()
-                        
+
                         for idx0 in m_indices_0:
                             pt = kpts0_np[idx0]
                             cv2.circle(img0_color, (int(pt[0]), int(pt[1])), 4, (0, 0, 255), -1)
                         for idx1 in m_indices_1:
                             pt = kpts1_np[idx1]
                             cv2.circle(img1_color, (int(pt[0]), int(pt[1])), 4, (0, 0, 255), -1)
-                        
+
                         try:
                             fig = plt.figure(figsize=(12, 6))
                             viz2d.plot_images([img0, img1])
@@ -679,73 +587,62 @@ class MultimodalValidationCallback(Callback):
                             plt.close(fig)
                         except Exception as e:
                             logger.warning(f"绘制匹配图失败: {e}")
-                
+
                 cv2.imwrite(str(save_path / "fix_with_kpts.png"), img0_color)
                 cv2.imwrite(str(save_path / "moving_with_kpts.png"), img1_color)
-                
+
                 try:
                     cb = create_chessboard(img1_result, img0)
                     cv2.imwrite(str(save_path / "chessboard.png"), cb)
                 except:
                     pass
-        
-        if failed_samples > 0 and save_images:
-            logger.info(f"Failed 样本: {failed_samples}/{batch_size}")
-        if inaccurate_samples > 0 and save_images:
-            logger.info(f"Inaccurate 样本: {inaccurate_samples}/{batch_size}")
-        
-        # 返回从 metrics_batch 获取的 MSE 和 MACE（已过滤掉 inf）
-        valid_mses = [m for m in mse_list if not np.isinf(m)]
-        valid_maces = [m for m in mace_list if not np.isinf(m)]
-        
-        return valid_mses, valid_maces
 
 # ==========================================
-# 早停机制
-# ==========================================
-class DelayedEarlyStopping(EarlyStopping):
-    def __init__(self, start_epoch=50, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.start_epoch = start_epoch
-    
-    def on_validation_end(self, trainer, pl_module):
-        if trainer.current_epoch >= self.start_epoch:
-            super().on_validation_end(trainer, pl_module)
-
-# ==========================================
-# 主函数
+# 参数解析和主函数
 # ==========================================
 def parse_args():
-    parser = argparse.ArgumentParser(description="MambaGlue CFFA Real-Data Training")
-    parser.add_argument('--name', '-n', type=str, default='mambaglue_cffa_baseline', help='训练名称')
+    parser = argparse.ArgumentParser(description="MambaGlue Unified Testing")
+    parser.add_argument('--name', '-n', type=str, required=True, help='训练模型名称')
+    parser.add_argument('--mode', type=str, default='gen', choices=['gen', 'cffa'], help='测试模式')
+    parser.add_argument('--test_name', type=str, default='test_results', help='测试名称')
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--num_workers', type=int, default=8)
     parser.add_argument('--img_size', type=int, default=512)
-    parser.add_argument('--start_point', type=str, default=None, help='从检查点恢复')
-    parser.add_argument('--max_epochs', type=int, default=200)
-    parser.add_argument('--gpus', type=str, default='1')
+    parser.add_argument('--checkpoint', type=str, default=None, help='检查点路径')
+    parser.add_argument('--gpus', type=str, default='0')
+    parser.add_argument('--split', type=str, default='val', choices=['train', 'val', 'test'], help='数据集划分')
     return parser.parse_args()
 
 def main():
     args = parse_args()
-    args.mode = 'cffa'
-    
+
     config = get_default_config()
     config.TRAINER.SEED = 66
     pl.seed_everything(config.TRAINER.SEED)
-    
-    result_dir = Path(f"results/mambaglue_{args.mode}/{args.name}")
-    result_dir.mkdir(parents=True, exist_ok=True)
-    log_file = result_dir / "log.txt"
-    
+
+    if args.checkpoint:
+        ckpt_path = Path(args.checkpoint)
+    else:
+        ckpt_path = Path(f"results/mambaglue_{args.mode}/{args.name}/best_checkpoint/model.ckpt")
+
+    if not ckpt_path.exists():
+        logger.error(f"检查点不存在: {ckpt_path}")
+        return
+
+    logger.info(f"加载检查点: {ckpt_path}")
+
+    output_dir = Path(f"results/mambaglue_{args.mode}/{args.name}/{args.test_name}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_file = output_dir / "test_log.txt"
+
     logger.remove()
     log_format = "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>"
     logger.add(sys.stderr, format=log_format, level="INFO")
-    logger.add(log_file, format=log_format, level="INFO", mode="a", backtrace=True, diagnose=False)
+    logger.add(log_file, format=log_format, level="INFO", mode="w", backtrace=True, diagnose=False)
     logger.info(f"日志将同时保存到: {log_file}")
-    
+
     os.environ['LOFTR_LOG_FILE'] = str(log_file)
-    
+
     if ',' in str(args.gpus):
         gpus_list = [int(x) for x in args.gpus.split(',')]
         _n_gpus = len(gpus_list)
@@ -756,58 +653,44 @@ def main():
         except:
             gpus_list = 'auto'
             _n_gpus = 1
-    
+
     config.TRAINER.WORLD_SIZE = max(_n_gpus, 1)
     config.TRAINER.TRUE_BATCH_SIZE = config.TRAINER.WORLD_SIZE * args.batch_size
     _scaling = config.TRAINER.TRUE_BATCH_SIZE / config.TRAINER.CANONICAL_BS
     config.TRAINER.TRUE_LR = config.TRAINER.CANONICAL_LR * _scaling
-    
-    model = PL_MambaGlue_Real(config, result_dir=str(result_dir))
-    data_module = MultimodalDataModule(args, config)
-    
-    tb_logger = TensorBoardLogger(save_dir='logs/tb_logs', name=f"mambaglue_{args.name}")
-    
-    early_stop_callback = DelayedEarlyStopping(
-        start_epoch=0,
-        monitor='combined_auc',
-        mode='max',
-        patience=10,
-        min_delta=0.0001,
-        strict=False  # 首个 epoch 若指标未出现不报错（兼容性保障）
+
+    mode_name = "CFFA真实数据（全量合并）"
+    logger.info(f"GPU: devices={gpus_list}, num_gpus={_n_gpus}")
+    logger.info(f"测试模式: {args.mode}")
+    logger.info(f"测试集: CFFA 全量数据（训练集 + 验证集合并）")
+    logger.info(f"输出目录: {output_dir}")
+
+    model = PL_MambaGlue.load_from_checkpoint(
+        str(ckpt_path),
+        config=config,
+        result_dir=str(output_dir)
     )
-    
-    logger.info("早停配置: monitor=combined_auc, start_epoch=0, patience=10, min_delta=0.0001")
-    
-    if not hasattr(args, 'mode'):
-        args.mode = 'cffa'
-    
-    logger.info(f"GPU 配置: devices={gpus_list}, num_gpus={_n_gpus}")
-    logger.info(f"学习率: {config.TRAINER.TRUE_LR:.6f} (scaled from {config.TRAINER.CANONICAL_LR})")
-    
+    model.eval()
+
+    data_module = MultimodalDataModule(args, config)
+    tb_logger = TensorBoardLogger(save_dir='logs/tb_logs', name=f"mambaglue_test_{args.name}_{args.test_name}")
+
     trainer_kwargs = {
-        'max_epochs': args.max_epochs,
         'accelerator': "gpu" if torch.cuda.is_available() else "cpu",
         'devices': gpus_list,
-        'num_sanity_val_steps': 0,
-        'check_val_every_n_epoch': 1,
-        'callbacks': [
-            MultimodalValidationCallback(args), 
-            LearningRateMonitor(logging_interval='step'), 
-            early_stop_callback
-        ],
+        'callbacks': [TestCallback(args, output_dir)],
         'logger': tb_logger,
     }
-    
+
     if _n_gpus > 1:
         trainer_kwargs['strategy'] = DDPStrategy(find_unused_parameters=False)
-    
+
     trainer = pl.Trainer(**trainer_kwargs)
-    
-    ckpt_path = args.start_point if args.start_point else None
-    
-    logger.info(f"开始真实数据训练: {args.name}")
-    trainer.fit(model, datamodule=data_module, ckpt_path=ckpt_path)
+
+    logger.info(f"开始测试 (模型: {args.name} | 测试集: CFFA 全量数据)")
+    trainer.test(model, datamodule=data_module)
+
+    logger.info(f"测试完成! 结果已保存到: {output_dir}")
 
 if __name__ == '__main__':
     main()
-

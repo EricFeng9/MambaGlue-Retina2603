@@ -2,6 +2,8 @@
 
 ## 一、总体架构
 
+本项目采用**统一评估框架**（`scripts/v1/test.py`），确保训练（`train_onGen_vessels.py`、`train_onReal.py`）和测试（`test.py`）阶段的指标计算完全一致，并与 `test_on_CrossModality.py` 对齐。
+
 ### 核心组件
 - **UnifiedEvaluator**：统一评估器类，负责累积误差并计算聚合指标
 - **compute_homography_errors**：底层指标计算函数（来自 `scripts/v1/metrics.py`）
@@ -52,13 +54,14 @@ pts1_pred = cv2.perspectiveTransform(pts0_homo, H).reshape(-1, 2)
 mse = np.mean((pts1 - pts1_pred) ** 2)
 ```
 
-#### 3.3 avg_dist 计算（用于 AUC）
+#### 3.3 avg_dist 计算（仅作内部参考，不再用于 AUC）
 ```python
 # 与 test_on_CrossModality.py 对齐：使用匹配点的平均重投影误差
 dis = (pts1 - pts1_pred) ** 2
 dis = np.sqrt(dis[:, 0] + dis[:, 1])
 avg_dist = dis.mean()
-all_errors.append(avg_dist)  # 用于 AUC 计算
+# 注意：原方法中 all_errors.append(avg_dist) 存在自拟合欺骗缺陷。
+# 现已修正为用 mace（角点误差）计算 AUC。
 ```
 
 #### 3.4 Inaccurate 判断
@@ -86,9 +89,9 @@ mace = np.mean(||corners_est - corners_gt||)
 ## 三、关键原则
 
 ### 1. 误差累积策略
-- **AUC 相关**：累积所有样本的误差
+- **AUC 相关**：累积所有样本的真实配准误差（MACE）
   - Failed 样本：error = 1e6
-  - Success 样本（包括 inaccurate）：error = avg_dist
+  - Success 样本（包括 inaccurate）：error = mace
   - 在 Epoch 结束后统一计算 AUC
 - **MSE/MACE**：仅统计 Acceptable 样本（mae ≤ 50 且 mee ≤ 20）
   - Failed 样本：用 inf 填充，最后过滤掉
@@ -125,7 +128,7 @@ mace = np.mean(||corners_est - corners_gt||)
 | AUC阈值 | [5,10,20] | [5,10,20] | [5,10,20] | [5,10,20] |
 | mAUC上限 | 25 | 25 | 25 | 25 |
 | **MSE计算** | **特征点坐标 MSE** | **特征点坐标 MSE** | **特征点坐标 MSE** | **特征点坐标 MSE** |
-| **AUC依据** | **avg_dist** | **avg_dist** | **avg_dist** | **avg_dist** |
+| **AUC依据** | **MACE（角点误差）** | **MACE（角点误差）** | **MACE（角点误差）** | **avg_dist**（原版遗留） |
 | **Failed判定** | **inliers < 1e-6** | **inliers < 1e-6** | **inliers < 1e-6** | **inliers < 1e-6** |
 | MACE计算 | compute_corner_error | compute_corner_error | compute_corner_error | - |
 | 失败样本处理 | error=1e6, MSE/MACE=inf | error=1e6, MSE/MACE=inf | error=1e6, MSE/MACE=inf | error=big_num |
@@ -183,9 +186,8 @@ scripts/v1/test.py
 │   ├── cv2.findHomography()  # RANSAC估计H
 │   ├── cv2.perspectiveTransform()  # 计算 pts1_pred
 │   ├── MSE = np.mean((pts1 - pts1_pred) ** 2)  # 特征点坐标MSE
-│   ├── avg_dist = dis.mean()  # 用于AUC计算
 │   ├── mae/mee 计算  # 用于判断inaccurate
-│   └── compute_corner_error()  # MACE计算
+│   └── compute_corner_error()  # 计算 mace，并作为 AUC 依据
 └── UnifiedEvaluator.compute_epoch_metrics()
     ├── error_auc()           # AUC@5/10/20
     ├── compute_auc_rop()     # mAUC
@@ -199,8 +201,8 @@ scripts/v1/test.py
 ### Q1: 为什么 AUC 和 MSE/MACE 的样本数不一致？
 **A**: AUC 包含所有样本（失败样本 error=1e6），MSE/MACE 仅包含匹配成功样本（过滤掉 inf）。
 
-### Q2: 为什么使用 avg_dist 而非角点误差计算 AUC？
-**A**: 与 `test_on_CrossModality.py` 保持一致。avg_dist 反映匹配点的重投影误差，更直接反映配准质量。
+### Q2: 为什么使用 mace 而非 avg_dist 计算 AUC？
+**A**: 使用 `avg_dist` 存在致命缺陷：它是由 RANSAC 自己拟合出的误差，就算找的点完全错误，只要模型把这些错点强行套进一个错误矩阵里，`avg_dist` 依然可能很小，形成自拟合欺骗。改为 `mace` (用预测 H 投影角点，与真实 H 投影角点的直接距离) 才能真正反映几何对齐的准确性。
 
 ### Q3: Spatial Binning 会影响最终配准结果吗？
 **A**: 不会。Spatial Binning 仅用于 RANSAC 估计 H，不影响匹配点的生成和最终的图像变换。

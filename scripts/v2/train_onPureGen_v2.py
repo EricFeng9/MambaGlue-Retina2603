@@ -548,9 +548,16 @@ class PL_MambaGlue_Gen(pl.LightningModule):
         set_metrics_verbose(True)  # 验证时输出详细日志
         compute_homography_errors(metrics_batch, self.config)
 
-        # 累积误差用于 epoch 结束时统一计算 AUC（使用 avg_dist，与测试脚本对齐）
+        # 【关键修改】累积误差用于 epoch 结束时统一计算 AUC（使用 avg_dist，与测试脚本对齐）
         if len(metrics_batch.get('avg_dist', [])) > 0:
             self._val_step_errors.extend(metrics_batch['avg_dist'])
+        
+        # 【关键修改】保存 metrics_batch 到实例变量，供 callback 使用
+        # metrics.py 已经按照 metrics_cau_principle_0304.md 规范计算了：
+        # - mse: 仅包含 Acceptable 样本（mae ≤ 50 且 mee ≤ 20），其他为 inf
+        # - mace: 仅包含 Acceptable 样本，其他为 inf
+        # - avg_dist: 包含所有样本（Failed 为 1e6，Success 为实际误差）
+        self._last_val_metrics = metrics_batch
         
         # 保存到实例变量供 callback 使用，不返回避免 Lightning 自动收集
         self._last_val_outputs = {
@@ -640,7 +647,9 @@ class MultimodalValidationCallback(Callback):
     def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
         # 从实例变量读取输出，因为 validation_step 返回 None
         outputs = pl_module._last_val_outputs if hasattr(pl_module, '_last_val_outputs') else {}
-        batch_mses, batch_maces = self._process_batch(trainer, pl_module, batch, outputs, None, save_images=False)
+        # 从实例变量读取 metrics.py 计算的结果
+        metrics_batch = pl_module._last_val_metrics if hasattr(pl_module, '_last_val_metrics') else {}
+        batch_mses, batch_maces = self._process_batch(trainer, pl_module, batch, outputs, metrics_batch, None, save_images=False)
         self.epoch_mses.extend(batch_mses)
         self.epoch_maces.extend(batch_maces)
 
@@ -749,41 +758,50 @@ class MultimodalValidationCallback(Callback):
                 pl_module.validation_step(batch, batch_idx)
                 # 从实例变量读取输出
                 outputs = pl_module._last_val_outputs if hasattr(pl_module, '_last_val_outputs') else {}
-                self._process_batch(trainer, pl_module, batch, outputs, target_dir, save_images=True)
+                metrics_batch = pl_module._last_val_metrics if hasattr(pl_module, '_last_val_metrics') else {}
+                self._process_batch(trainer, pl_module, batch, outputs, metrics_batch, target_dir, save_images=True)
         pl_module.force_viz = False
 
-    def _process_batch(self, trainer, pl_module, batch, outputs, epoch_dir, save_images=False):
-        batch_size = batch['image0'].shape[0]
-        mses, maces = [], []
-        H_ests = outputs.get('H_est', [np.eye(3)] * batch_size)
-        Ts_gt = batch['T_0to1'].cpu().numpy()
+    def _process_batch(self, trainer, pl_module, batch, outputs, metrics_batch, epoch_dir, save_images=False):
+        """
+        处理测试批次，直接使用 metrics.py 的计算结果
+        严格按照 metrics_cau_principle_0304.md 的逻辑进行统计
         
-        rejected_count = 0
-        failed_count = 0
+        Args:
+            metrics_batch: metrics.py 返回的字典，包含 mse, mace, avg_dist 等
+        """
+        batch_size = batch['image0'].shape[0]
+        H_ests = outputs.get('H_est', [np.eye(3)] * batch_size)
+        
+        # 【关键修改】直接从 metrics_batch 获取 MSE 和 MACE，而不是自己计算
+        # metrics.py 按照 metrics_cau_principle_0304.md 计算：
+        # - mse/mace: 仅包含 Acceptable 样本（mae ≤ 50 且 mee ≤ 20），其他为 inf
+        # - avg_dist: 包含所有样本（Failed 为 1e6，Success 为实际误差）
+        mse_list = metrics_batch.get('mse', [])
+        mace_list = metrics_batch.get('mace', [])
+        avg_dist_list = metrics_batch.get('avg_dist', [])
+        
+        failed_samples = 0
+        inaccurate_samples = 0
+        acceptable_samples = 0
         
         for i in range(batch_size):
+            # 判断样本类型（按照 metrics_cau_principle_0304.md）
+            if i < len(avg_dist_list):
+                avg_dist = avg_dist_list[i]
+                # Failed: avg_dist = 1e6
+                if np.isclose(avg_dist, 1e6):
+                    failed_samples += 1
+                else:
+                    # Success 样本，判断是 Inaccurate 还是 Acceptable
+                    if i < len(mse_list) and np.isinf(mse_list[i]):
+                        inaccurate_samples += 1
+                    else:
+                        acceptable_samples += 1
+            
+            # 后续代码保持不变，用于可视化
             H_est = H_ests[i]
-            
-            # 判断是否匹配失败（与测试脚本保持一致）
-            is_match_failed = False
-            if not is_valid_homography(H_est):
-                H_est = np.eye(3)
-                rejected_count += 1
-                is_match_failed = True
-            elif np.allclose(H_est, np.eye(3), atol=1e-3):
-                is_match_failed = True
-            
-            # 检查匹配点数量
-            if 'matches0' in outputs:
-                m0 = outputs['matches0'][i].cpu()
-                valid = m0 > -1
-                num_matches = torch.sum(valid).item()
-                if num_matches < 4:
-                    is_match_failed = True
-            
-            if is_match_failed:
-                failed_count += 1
-            
+
             img0 = (batch['image0'][i, 0].cpu().numpy() * 255).astype(np.uint8)
             img1 = (batch['image1'][i, 0].cpu().numpy() * 255).astype(np.uint8)
             img1_gt = (batch['image1_gt'][i, 0].cpu().numpy() * 255).astype(np.uint8)
@@ -794,17 +812,6 @@ class MultimodalValidationCallback(Callback):
                 img1_result = cv2.warpPerspective(img1, H_inv, (w, h))
             except:
                 img1_result = img1.copy()
-            
-            # 只在匹配成功的样本上计算 MSE 和 MACE（与测试脚本保持一致）
-            if not is_match_failed:
-                try:
-                    res_f, orig_f = filter_valid_area(img1_result, img1_gt)
-                    mask = (res_f > 0)
-                    mse = np.mean((res_f[mask].astype(np.float64) - orig_f[mask].astype(np.float64))**2) if np.any(mask) else 0.0
-                except:
-                    mse = 0.0
-                mses.append(mse)
-                maces.append(compute_corner_error(H_est, Ts_gt[i], h, w))
             
             if save_images:
                 sample_name = f"{Path(batch['pair_names'][0][i]).stem}_vs_{Path(batch['pair_names'][1][i]).stem}"
@@ -861,12 +868,16 @@ class MultimodalValidationCallback(Callback):
                 except:
                     pass
         
-        if rejected_count > 0 and save_images:
-            logger.info(f"防爆锁触发: {rejected_count}/{batch_size} 个样本的单应矩阵被重置为单位矩阵")
-        if failed_count > 0 and save_images:
-            logger.info(f"匹配失败: {failed_count}/{batch_size} 个样本")
+        if failed_samples > 0 and save_images:
+            logger.info(f"Failed 样本: {failed_samples}/{batch_size}")
+        if inaccurate_samples > 0 and save_images:
+            logger.info(f"Inaccurate 样本: {inaccurate_samples}/{batch_size}")
         
-        return mses, maces
+        # 返回从 metrics_batch 获取的 MSE 和 MACE（已过滤掉 inf）
+        valid_mses = [m for m in mse_list if not np.isinf(m)]
+        valid_maces = [m for m in mace_list if not np.isinf(m)]
+        
+        return valid_mses, valid_maces
 
 # ==========================================
 # 课程学习调度器
