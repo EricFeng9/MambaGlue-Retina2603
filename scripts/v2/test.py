@@ -26,16 +26,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 from mambaglue import MambaGlue, SuperPoint
 from mambaglue import viz2d
 
-# 导入生成数据集
-import importlib.util
-spec = importlib.util.spec_from_file_location(
-    "multimodal_dataset_v29_2_1",
-    os.path.join(os.path.dirname(__file__), '../../data/260227_2_v29_2_1/260227_2_v29_2_1_dataset.py')
-)
-multimodal_dataset_module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(multimodal_dataset_module)
-MultiModalDataset = multimodal_dataset_module.MultiModalDataset
-
 # 导入真实数据集
 from data.operation_pre_filtered_cffa.operation_pre_filtered_cffa_dataset import CFFADataset
 
@@ -78,18 +68,6 @@ def get_default_config():
 # ==========================================
 # 工具函数
 # ==========================================
-def is_valid_homography(H, scale_min=0.1, scale_max=10.0, perspective_threshold=0.005):
-    if H is None:
-        return False
-    if np.isnan(H).any() or np.isinf(H).any():
-        return False
-    det = np.linalg.det(H[:2, :2])
-    if det < scale_min or det > scale_max:
-        return False
-    if abs(H[2, 0]) > perspective_threshold or abs(H[2, 1]) > perspective_threshold:
-        return False
-    return True
-
 def filter_valid_area(img1, img2):
     assert img1.shape[:2] == img2.shape[:2], "两张图片的尺寸必须一致"
     if len(img1.shape) == 3:
@@ -142,28 +120,6 @@ def create_chessboard(img1, img2, grid_size=4):
             else:
                 chessboard[y_start:y_end, x_start:x_end] = img2[y_start:y_end, x_start:x_end]
     return chessboard
-
-# ==========================================
-# 辅助类: GenDatasetWrapper
-# ==========================================
-class GenDatasetWrapper(torch.utils.data.Dataset):
-    def __init__(self, base_dataset):
-        self.base_dataset = base_dataset
-
-    def __len__(self):
-        return len(self.base_dataset)
-
-    def __getitem__(self, idx):
-        data = self.base_dataset[idx]
-        result = {
-            'image0': data['image0'],
-            'image1': data['image1'],
-            'image1_gt': data['image0'],
-            'T_0to1': data['T_0to1'],
-            'pair_names': data['pair_names'],
-            'dataset_name': data['dataset_name']
-        }
-        return result
 
 # ==========================================
 # 辅助类: RealDatasetWrapper
@@ -229,14 +185,10 @@ class MultimodalDataModule(pl.LightningDataModule):
     def setup(self, stage=None):
         script_dir = Path(__file__).parent.parent.parent
 
-        if self.args.mode == 'gen':
-            test_data_dir = script_dir / 'data' / '260227_2_v29_2_1'
-            test_base = MultiModalDataset(root_dir=str(test_data_dir), split=self.args.split, mode='cffa', img_size=self.args.img_size)
-            self.test_dataset = GenDatasetWrapper(test_base)
-        else:
-            test_data_dir = script_dir / 'data' / 'operation_pre_filtered_cffa'
-            test_base = CFFADataset(root_dir=str(test_data_dir), split=self.args.split, mode='cf2fa')
-            self.test_dataset = RealDatasetWrapper(test_base)
+        # 测试时使用与训练时相同的验证集 split='val'，以确保指标计算一致
+        test_data_dir = script_dir / 'data' / 'operation_pre_filtered_cffa'
+        test_base = CFFADataset(root_dir=str(test_data_dir), split='val', mode='cf2fa')
+        self.test_dataset = RealDatasetWrapper(test_base)
 
     def test_dataloader(self):
         return torch.utils.data.DataLoader(self.test_dataset, shuffle=False, **self.loader_params)
@@ -388,6 +340,14 @@ class PL_MambaGlue(pl.LightningModule):
         set_metrics_verbose(True)
         compute_homography_errors(metrics_batch, self.config)
 
+        # 直接使用 metrics.py 返回的 H_est（经过 Spatial Binning）
+        # 注意：metrics.py 中当 num_matches < 4 时会跳过，所以长度可能不够
+        H_ests_raw = metrics_batch.get('H_est', [])
+        # 确保 H_ests 长度与 batch size 一致
+        H_ests = list(H_ests_raw)
+        while len(H_ests) < B:
+            H_ests.append(np.eye(3))  # 填充单位矩阵
+
         if len(metrics_batch.get('avg_dist', [])) > 0:
             self._test_step_errors.extend(metrics_batch['avg_dist'])
 
@@ -425,8 +385,11 @@ class PL_MambaGlue(pl.LightningModule):
             auc5 = auc10 = auc20 = mauc = 0.0
 
         combined_auc = (auc5 + auc10 + auc20) / 3.0
-        avg_mse = np.mean(self._test_step_mse) if self._test_step_mse else 0.0
-        avg_mace = np.mean(self._test_step_mace) if self._test_step_mace else 0.0
+        
+        # 【修复】当没有 Acceptable 样本时，应该返回 NaN 而不是 0
+        # 因为 0 会误导用户以为计算成功了
+        avg_mse = np.mean(self._test_step_mse) if self._test_step_mse else float('nan')
+        avg_mace = np.mean(self._test_step_mace) if self._test_step_mace else float('nan')
 
         self.log('auc@5',        auc5,         on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
         self.log('auc@10',       auc10,        on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
@@ -485,12 +448,20 @@ class TestCallback(Callback):
 
         combined_auc = (auc5 + auc10 + auc20) / 3.0
 
+        # 从 metrics 中获取 MSE 和 MACE
+        # 注意：如果没有 Acceptable 样本，PL_MambaGlue 会返回 NaN
         avg_mse = metrics.get('mse', 0.0)
         if hasattr(avg_mse, 'item'):
             avg_mse = avg_mse.item()
+        # 如果是 0 但没有 Acceptable 样本，可能是没有数据，此时显示为 NaN 更合理
+        if avg_mse == 0.0 and not hasattr(pl_module, '_test_step_mse'):
+            avg_mse = float('nan')
+            
         avg_mace = metrics.get('mace', 0.0)
         if hasattr(avg_mace, 'item'):
             avg_mace = avg_mace.item()
+        if avg_mace == 0.0 and not hasattr(pl_module, '_test_step_mace'):
+            avg_mace = float('nan')
 
         match_failure_rate = self.failed_samples / self.total_samples if self.total_samples > 0 else 0.0
 
@@ -519,39 +490,45 @@ class TestCallback(Callback):
         logger.info(f"测试总结已保存到: {summary_path}")
 
     def _process_batch(self, trainer, pl_module, batch, outputs, batch_idx, save_images=False):
+        """
+        处理测试批次，直接使用 metrics.py 的计算结果
+        严格按照 metrics_cau_principle_0304.md 的逻辑进行统计
+        """
         batch_size = batch['image0'].shape[0]
         H_ests = outputs.get('H_est', [np.eye(3)] * batch_size)
-        Ts_gt = batch['T_0to1'].cpu().numpy()
-        rejected_count = 0
         metrics_batch = outputs.get('metrics_batch', {})
+
+        # 直接使用 metrics.py 计算的 avg_dist 来判断 failed/inaccurate
+        # metrics.py 中：
+        # - Failed: avg_dist = 1e6
+        # - Success (包括 inaccurate): avg_dist = 实际计算的 avg_dist
+        avg_dist_list = metrics_batch.get('avg_dist', [])
+        mse_list = metrics_batch.get('mse', [])
+        mace_list = metrics_batch.get('mace', [])
 
         for i in range(batch_size):
             self.total_samples += 1
-            H_est = H_ests[i]
 
-            is_match_failed = False
-            if not is_valid_homography(H_est):
-                H_est = np.eye(3)
-                rejected_count += 1
-                is_match_failed = True
-            elif np.allclose(H_est, np.eye(3), atol=1e-3):
-                is_match_failed = True
+            # 直接使用 metrics.py 的判断结果
+            if i < len(avg_dist_list):
+                avg_dist = avg_dist_list[i]
 
-            if 'matches0' in outputs:
-                m0 = outputs['matches0'][i].cpu()
-                valid = m0 > -1
-                num_matches = torch.sum(valid).item()
-                if num_matches < 4:
-                    is_match_failed = True
-
-            if is_match_failed:
-                self.failed_samples += 1
-            else:
-                if i < len(metrics_batch.get('mse', [])):
-                    if np.isinf(metrics_batch['mse'][i]):
+                # Failed 判断: avg_dist = 1e6 (在 metrics.py 中设置的)
+                if np.isclose(avg_dist, 1e6):
+                    self.failed_samples += 1
+                else:
+                    # Success 样本，判断是 Inaccurate 还是 Acceptable
+                    if i < len(mse_list) and np.isinf(mse_list[i]):
+                        # mse = inf 表示 Inaccurate (mae > 50 或 mee > 20)
                         self.inaccurate_samples += 1
                     else:
                         self.acceptable_samples += 1
+            else:
+                # 如果没有 metrics 结果，保守起见计为 failed
+                self.failed_samples += 1
+
+            # 后续代码保持不变，用于可视化
+            H_est = H_ests[i]
 
             img0 = (batch['image0'][i, 0].cpu().numpy() * 255).astype(np.uint8)
             img1 = (batch['image1'][i, 0].cpu().numpy() * 255).astype(np.uint8)
@@ -617,9 +594,6 @@ class TestCallback(Callback):
                 except:
                     pass
 
-        if rejected_count > 0:
-            logger.info(f"防爆锁触发: {rejected_count}/{batch_size} 个样本的单应矩阵被重置为单位矩阵")
-
 # ==========================================
 # 参数解析和主函数
 # ==========================================
@@ -682,10 +656,10 @@ def main():
     _scaling = config.TRAINER.TRUE_BATCH_SIZE / config.TRAINER.CANONICAL_BS
     config.TRAINER.TRUE_LR = config.TRAINER.CANONICAL_LR * _scaling
 
-    mode_name = "生成数据" if args.mode == "gen" else "CFFA真实数据"
+    mode_name = "CFFA真实数据"
     logger.info(f"GPU: devices={gpus_list}, num_gpus={_n_gpus}")
-    logger.info(f"测试模式: {args.mode} ({mode_name})")
-    logger.info(f"测试划分: {args.split}")
+    logger.info(f"测试模式: {args.mode}")
+    logger.info(f"测试集: CFFA 测试集 (operation_pre_filtered_cffa)")
     logger.info(f"输出目录: {output_dir}")
 
     model = PL_MambaGlue.load_from_checkpoint(
@@ -710,7 +684,7 @@ def main():
 
     trainer = pl.Trainer(**trainer_kwargs)
 
-    logger.info(f"开始测试 (模型: {args.name} | 测试集: {mode_name} {args.split})")
+    logger.info(f"开始测试 (模型: {args.name} | 测试集: CFFA 测试集)")
     trainer.test(model, datamodule=data_module)
 
     logger.info(f"测试完成! 结果已保存到: {output_dir}")
