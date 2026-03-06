@@ -1,9 +1,9 @@
 """
-针对 train_onMultiGen_vessels_enhanced_mambaglue.py 训练权重的测试脚本
+针对 train_onMultiGen_vessels_enhanced.py 训练权重的测试脚本
 
 测试内容：
 - 使用 --name 指定的权重，对三个数据集全量数据（train+val 合并）做测试
-- --baseline 模式：额外运行 MambaGlue 原生预训练权重作为基准
+- --baseline 模式：额外运行 LightGlue 原生预训练权重作为基准
 - 最终输出三个数据集上、生成数据训练 vs baseline 的对比表格（CSV）
 - 每个数据集输出 5 个样本可视化结果
 """
@@ -22,8 +22,8 @@ import csv
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
-from mambaglue import MambaGlue
-from mambaglue.superpoint import SuperPoint
+from lightglue import LightGlue
+from lightglue.superpoint import SuperPoint
 
 from scripts.v2.metrics import (
     compute_homography_errors,
@@ -314,7 +314,7 @@ def _visualize_samples(batch, outputs, output_dir, batch_idx, viz_counters, max_
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     try:
-        from mambaglue import viz2d
+        from lightglue import viz2d
         has_viz2d = True
     except Exception:
         has_viz2d = False
@@ -473,28 +473,18 @@ def run_evaluation_per_dataset(model, dataloaders, config, save_visualizations=F
 # 模型加载
 # ---------------------------------------------------------------------------
 
-class BaselineMambaGlueModel(pl.LightningModule):
-    """使用 MambaGlue 原生预训练权重的 baseline 模型"""
+class BaselineLightGlueModel(pl.LightningModule):
+    """使用 LightGlue 原生预训练权重的 baseline 模型"""
     def __init__(self, config):
         super().__init__()
         self.config = config
-        # 特征提取器 (SuperPoint) - 冻结
         self.extractor = SuperPoint(max_num_keypoints=2048).eval()
-        # 尝试加载预训练权重
-        sp_url = "https://github.com/cvg/LightGlue/releases/download/v0.1_arxiv/superpoint_v1.pth"
-        try:
-            sp_state = torch.hub.load_state_dict_from_url(sp_url, map_location='cpu')
-            self.extractor.load_state_dict(sp_state, strict=False)
-            logger.info("成功加载 SuperPoint 预训练权重")
-        except Exception as e:
-            logger.warning(f"加载 SuperPoint 预训练权重失败: {e}，使用随机初始化")
-        
         for param in self.extractor.parameters():
             param.requires_grad = False
 
-        # 匹配器 (MambaGlue) - 使用预训练权重
-        mg_conf = config.MATCHING.copy()
-        self.matcher = MambaGlue(**mg_conf).eval()
+        lg_conf = config.MATCHING.copy()
+        lg_conf['weights'] = 'superpoint_lightglue'
+        self.matcher = LightGlue(**lg_conf).eval()
         for param in self.matcher.parameters():
             param.requires_grad = False
 
@@ -527,10 +517,10 @@ class BaselineMambaGlueModel(pl.LightningModule):
 
 
 def load_trained_model(ckpt_path, config, output_dir):
-    """加载 train_onMultiGen_vessels_enhanced_mambaglue 训练的模型"""
+    """加载 train_onMultiGen_vessels_enhanced 训练的模型"""
     import importlib
-    module = importlib.import_module('scripts.v2_multi.train_onMultiGen_vessels_enhanced_mambaglue')
-    pl_class = getattr(module, 'PL_MambaGlue_Gen')
+    module = importlib.import_module('scripts.v2_multi.train_onMultiGen_vessels_enhanced')
+    pl_class = getattr(module, 'PL_LightGlue_Gen')
     model = pl_class.load_from_checkpoint(
         str(ckpt_path),
         config=config,
@@ -677,16 +667,16 @@ def print_comparison_table(trained_results, baseline_results=None):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="针对 train_onMultiGen_vessels_enhanced_mambaglue 权重的测试脚本（三个全量数据集）"
+        description="针对 train_onMultiGen_vessels_enhanced 权重的测试脚本（三个全量数据集）"
     )
     parser.add_argument('--name', '-n', type=str, required=True,
-                        help='模型名称（results/mambaglue_gen/<name>/best_checkpoint/model.ckpt）')
+                        help='模型名称（results/lightglue_gen/<name>/best_checkpoint/model.ckpt）')
     parser.add_argument('--test_name', '-t', type=str, required=True,
-                        help='测试名称（结果保存在 results/mambaglue_gen/<name>/<test_name>/）')
+                        help='测试名称（结果保存在 results/lightglue_gen/<name>/<test_name>/）')
     parser.add_argument('--checkpoint', '-c', type=str, default=None,
-                        help='检查点路径（默认 results/mambaglue_gen/<name>/best_checkpoint/model.ckpt）')
+                        help='检查点路径（默认 results/lightglue_gen/<name>/best_checkpoint/model.ckpt）')
     parser.add_argument('--baseline', action='store_true',
-                        help='额外运行 MambaGlue 原生预训练权重作为 baseline 并输出对比表格')
+                        help='额外运行 LightGlue 原生预训练权重作为 baseline 并输出对比表格')
     parser.add_argument('--batch_size', type=int, default=4, help='批次大小')
     parser.add_argument('--num_workers', type=int, default=8, help='数据加载线程数')
     parser.add_argument('--gpus', type=str, default='0', help='GPU设备ID')
@@ -701,7 +691,7 @@ def main():
     if args.checkpoint:
         ckpt_path = Path(args.checkpoint)
     else:
-        ckpt_path = Path(f"results/mambaglue_gen/{args.name}/best_checkpoint/model.ckpt")
+        ckpt_path = Path(f"results/lightglue_gen/{args.name}/best_checkpoint/model.ckpt")
 
     if not ckpt_path.exists():
         logger.error(f"检查点不存在: {ckpt_path}")
@@ -709,7 +699,7 @@ def main():
         return
 
     # 输出目录
-    output_dir = Path(f"results/mambaglue_gen/{args.name}/{args.test_name}")
+    output_dir = Path(f"results/lightglue_gen/{args.name}/{args.test_name}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # 日志
@@ -734,7 +724,7 @@ def main():
 
     # 获取配置
     import importlib
-    module = importlib.import_module('scripts.v2_multi.train_onMultiGen_vessels_enhanced_mambaglue')
+    module = importlib.import_module('scripts.v2_multi.train_onMultiGen_vessels_enhanced')
     get_default_config = getattr(module, 'get_default_config')
     config = get_default_config()
     pl.seed_everything(config.TRAINER.SEED)
@@ -781,10 +771,10 @@ def main():
     baseline_results = None
     if args.baseline:
         logger.info("=" * 60)
-        logger.info("Step 2/2: 测试 Baseline（MambaGlue 原生预训练权重）")
+        logger.info("Step 2/2: 测试 Baseline（LightGlue 原生预训练权重）")
         logger.info("=" * 60)
 
-        baseline_model = BaselineMambaGlueModel(config)
+        baseline_model = BaselineLightGlueModel(config)
         baseline_model = baseline_model.to(device)
         baseline_model.eval()
 
