@@ -32,8 +32,8 @@ from data.operation_pre_filtered_cffa.operation_pre_filtered_cffa_dataset import
 from data.operation_pre_filtered_cfoct.operation_pre_filtered_cfoct_dataset import CFOCTDataset
 from data.operation_pre_filtered_octfa.operation_pre_filtered_octfa_dataset import OCTFADataset
 
-# 导入指标计算模块（v2版本，对齐 metrics_cau_principle_0304.md）
-from scripts.v2.metrics import (
+# 导入指标计算模块（v2_multi版本，对齐 metrics_cau_principle_0305.md）
+from scripts.v2_multi.metrics import (
     compute_homography_errors,
     aggregate_metrics,
     set_metrics_verbose,
