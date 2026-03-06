@@ -277,7 +277,8 @@ def compute_homography_errors(data, config):
             data['H_est'].append(np.eye(3))
             data['mse'].append(np.inf)
             data['mace'].append(np.inf)
-            data['avg_dist'].append(1e6)  # 用于 AUC 计算
+            data['avg_dist'].append(1e6)
+            data['auc_error'].append(1e6)  # Failed 样本：纳入 AUC 计算
             continue
 
         # 估计单应矩阵 (对应 plan.md 第四阶段: 几何估计)
@@ -307,7 +308,8 @@ def compute_homography_errors(data, config):
             data['H_est'].append(np.eye(3))
             data['mse'].append(np.inf)
             data['mace'].append(np.inf)
-            data['avg_dist'].append(1e6)  # 用于 AUC 计算
+            data['avg_dist'].append(1e6)
+            data['auc_error'].append(1e6)  # Failed 样本：纳入 AUC 计算
             continue
 
         # 【调试】检查 inliers 数量和矩阵状态
