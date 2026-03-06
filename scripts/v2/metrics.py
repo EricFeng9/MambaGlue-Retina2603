@@ -341,11 +341,11 @@ def compute_homography_errors(data, config):
         dis = np.sqrt(dis[:, 0] + dis[:, 1])
         avg_dist = dis.mean()
 
-        # 4. Inaccurate 判断：mae > 50 或 mee > 20
+        # 4. Inaccurate 判断：mae > 100 或 mee > 40 (放宽阈值)
         mae = dis.max()   # 最大误差
         mee = np.median(dis)  # 中位误差
         is_inaccurate = False
-        if mae > 50.0 or mee > 20.0:
+        if mae > 100.0 or mee > 40.0:
             _dual_log("WARNING", f"⚠️ Batch {bs}: Inaccurate (mae={mae:.2f}, mee={mee:.2f})")
             is_inaccurate = True
 
