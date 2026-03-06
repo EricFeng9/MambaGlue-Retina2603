@@ -31,6 +31,7 @@ from mambaglue import viz2d
 from data.operation_pre_filtered_cffa.operation_pre_filtered_cffa_dataset import CFFADataset
 from data.operation_pre_filtered_cfoct.operation_pre_filtered_cfoct_dataset import CFOCTDataset
 from data.operation_pre_filtered_octfa.operation_pre_filtered_octfa_dataset import OCTFADataset
+from data.CF_OCTA_v2_repaired.cf_octa_v2_repaired_dataset import CFOCTADataset
 
 # 导入指标计算模块（v2_multi版本，对齐 metrics_cau_principle_0305.md）
 from scripts.v2_multi.metrics import (
@@ -234,6 +235,13 @@ class TestDataModule:
             octfa_dataset = RealDatasetWrapper(octfa_base, split_name='test', dataset_name='OCTFA')
             logger.info(f"加载 OCTFA 测试集: {len(octfa_dataset)} 样本")
             val_dataset_list.append(octfa_dataset)
+
+        if datasets is None or 'CFOCTA' in datasets:
+            cfocta_dir = script_dir / 'data' / 'CF_OCTA_v2_repaired'
+            cfocta_base = CFOCTADataset(root_dir=str(cfocta_dir), split='val', mode='cf2octa')
+            cfocta_dataset = RealDatasetWrapper(cfocta_base, split_name='test', dataset_name='CFOCTA')
+            logger.info(f"加载 CFOCTA 测试集: {len(cfocta_dataset)} 样本")
+            val_dataset_list.append(cfocta_dataset)
 
         from torch.utils.data import ConcatDataset
         val_dataset = ConcatDataset(val_dataset_list)
