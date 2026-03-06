@@ -300,7 +300,6 @@ def compute_homography_errors(data, config):
             H_est, inliers = cv2.findHomography(pts0_batch, pts1_batch, cv2.RANSAC, config.TRAINER.RANSAC_PIXEL_THR)
 
         if H_est is None:
-            # 【调试】RANSAC 失败，记录原因
             _dual_log("WARNING", f"⚠️ Batch {bs}: RANSAC 返回 None (匹配点数: {len(bin_indices) if len(bin_indices) >= 4 else num_matches})")
             data['R_errs'].append(np.inf)
             data['t_errs'].append(np.inf)
@@ -312,14 +311,14 @@ def compute_homography_errors(data, config):
             data['auc_error'].append(1e6)  # Failed 样本：纳入 AUC 计算
             continue
 
-        # 【调试】检查 inliers 数量和矩阵状态
+        # 检查 inliers 数量和矩阵状态
         num_inliers = np.sum(inliers.ravel() > 0) if inliers is not None else 0
         inliers_rate = num_inliers / len(pts0_batch) if len(pts0_batch) > 0 else 0
         is_identity = np.allclose(H_est, np.eye(3), atol=1e-3)
 
         _dual_log("INFO", f"✅ Batch {bs}: RANSAC 成功, inliers={num_inliers}/{len(bin_indices) if len(bin_indices) >= 4 else num_matches}, H_est是否单位矩阵={is_identity}")
 
-        # ====== 完全对齐 metrics_cau_principle_0304.md ======
+        # ====== 完全对齐 metrics_cau_principle_0305.md ======
 
         # 1. Failed 判断：inliers rate < 1e-6 或 H_est 接近单位矩阵
         is_failed = False
@@ -330,79 +329,46 @@ def compute_homography_errors(data, config):
             _dual_log("WARNING", f"⚠️ Batch {bs}: H_est 接近单位矩阵! 判定为 Failed")
             is_failed = True
 
-        # 2. 计算特征点坐标 MSE（使用 cv2.perspectiveTransform）
+        # 2. 计算特征点坐标 MSE（对齐 principle 3.2：使用全部匹配点）
         h, w = data['image0'].shape[2:]
         pts0_homo = pts0_batch.reshape(-1, 1, 2).astype(np.float32)
         pts1_pred = cv2.perspectiveTransform(pts0_homo, H_est).reshape(-1, 2)
+        mse = np.mean((pts1_batch - pts1_pred) ** 2)
 
-        # 计算所有匹配点的重投影误差（含 outlier，仅用于 avg_dist 参考）
-        dis_all = (pts1_batch - pts1_pred) ** 2
-        dis_all = np.sqrt(dis_all[:, 0] + dis_all[:, 1])
-        avg_dist = dis_all.mean()
+        # 3. avg_dist / dis 计算（对齐 principle 3.3：使用全部匹配点）
+        diff = (pts1_batch - pts1_pred) ** 2
+        dis = np.sqrt(diff[:, 0] + diff[:, 1])
+        avg_dist = dis.mean()
 
-        # 【修复】mae/mee/MSE 只在 RANSAC inlier 点上计算
-        # 原因：RANSAC 拒绝的 outlier 点误差本来就很大，
-        # 用全部点的 dis.max() 会虚高，导致所有样本被误判为 Inaccurate
-        if inliers is not None and np.sum(inliers.ravel() > 0) > 0:
-            if len(bin_indices) >= 4:
-                # RANSAC 在 pts0_ransac = pts0_batch[bin_indices] 上运行
-                # inliers mask 指向 pts0_ransac，需映射回 pts0_batch
-                inlier_mask_ransac = inliers.ravel() > 0
-                inlier_global_indices = bin_indices[inlier_mask_ransac]
-                pts0_inlier = pts0_batch[inlier_global_indices]
-                pts1_inlier = pts1_batch[inlier_global_indices]
-            else:
-                inlier_mask_ransac = inliers.ravel() > 0
-                pts0_inlier = pts0_batch[inlier_mask_ransac]
-                pts1_inlier = pts1_batch[inlier_mask_ransac]
-
-            pts0_inlier_homo = pts0_inlier.reshape(-1, 1, 2).astype(np.float32)
-            pts1_inlier_pred = cv2.perspectiveTransform(pts0_inlier_homo, H_est).reshape(-1, 2)
-
-            # 计算 MSE（仅 inlier）
-            mse = np.mean((pts1_inlier - pts1_inlier_pred) ** 2)
-
-            # 计算 dis（仅 inlier），用于 mae/mee 判断
-            dis = (pts1_inlier - pts1_inlier_pred) ** 2
-            dis = np.sqrt(dis[:, 0] + dis[:, 1])
-        else:
-            # 无 inlier 时回退用全部点（此时 is_failed 应已为 True）
-            mse = np.mean((pts1_batch - pts1_pred) ** 2)
-            dis = dis_all
-
-        # 4. Inaccurate 判断：mae > 50 或 mee > 20（与 metrics_cau_principle_0305.md 对齐）
-        # 注意：此处 mae/mee 基于 RANSAC inlier 点，不再受 outlier 污染
-        mae = dis.max()   # 最大误差（inlier 点）
-        mee = np.median(dis)  # 中位误差（inlier 点）
+        # 4. Inaccurate 判断（对齐 principle 3.4：mae > 50 或 mee > 20）
+        mae = dis.max()
+        mee = np.median(dis)
         is_inaccurate = False
         if mae > 50.0 or mee > 20.0:
             _dual_log("WARNING", f"⚠️ Batch {bs}: Inaccurate (mae={mae:.2f}, mee={mee:.2f})")
             is_inaccurate = True
 
-        # 5. MACE 计算（四角点平均重投影误差）
+        # 5. MACE 计算（对齐 principle 3.5：四角点平均重投影误差）
         corners = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float32)
         corners_h = np.concatenate([corners, np.ones((4, 1))], axis=-1)
 
-        # 使用真值 H 投影得到 GT 坐标
         corners_gt_h = (H_gt[bs] @ corners_h.T).T
         corners_gt = corners_gt_h[:, :2] / (corners_gt_h[:, 2:] + 1e-7)
 
-        # 使用估计 H 投影得到预测坐标
         corners_est_h = (H_est @ corners_h.T).T
         corners_est = corners_est_h[:, :2] / (corners_est_h[:, 2:] + 1e-7)
 
-        # 计算平均角点误差
         mace = np.mean(np.linalg.norm(corners_est - corners_gt, axis=-1))
 
-        # ====== 误差累积策略（对齐 metrics_cau_principle_0304.md）======
+        # ====== 误差累积策略（对齐 metrics_cau_principle_0305.md 第三章）======
 
-        # AUC 相关：累积所有样本的误差
+        # AUC 相关：Failed=1e6，Success（含 inaccurate）=mace
         if is_failed:
-            data['avg_dist'].append(1e6)  # 仅起占位作用
-            data['auc_error'].append(1e6) # Failed 样本: error = 1e6
+            data['avg_dist'].append(1e6)
+            data['auc_error'].append(1e6)
         else:
             data['avg_dist'].append(avg_dist)
-            data['auc_error'].append(mace) # Success 样本（包括 inaccurate）: error = mace
+            data['auc_error'].append(mace)
 
         # MSE/MACE：仅统计 Acceptable 样本（mae ≤ 50 且 mee ≤ 20）
         if is_failed or is_inaccurate:
@@ -412,9 +378,9 @@ def compute_homography_errors(data, config):
             data['mse'].append(mse)
             data['mace'].append(mace)
 
-        # 保存 R_errs 和 t_errs（用于兼容性）
+        # 保存 R_errs / t_errs（用于兼容性，t_errs 使用 MACE）
         data['R_errs'].append(0.0)
-        data['t_errs'].append(mace)  # 使用 MACE 作为 t_errs
+        data['t_errs'].append(mace)
         data['inliers'].append(inliers.ravel() > 0 if inliers is not None else np.array([]).astype(bool))
         data['H_est'].append(H_est)
 
