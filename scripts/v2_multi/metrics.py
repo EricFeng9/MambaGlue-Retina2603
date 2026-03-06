@@ -335,17 +335,45 @@ def compute_homography_errors(data, config):
         pts0_homo = pts0_batch.reshape(-1, 1, 2).astype(np.float32)
         pts1_pred = cv2.perspectiveTransform(pts0_homo, H_est).reshape(-1, 2)
 
-        # 计算 MSE（特征点坐标 MSE）
-        mse = np.mean((pts1_batch - pts1_pred) ** 2)
+        # 计算所有匹配点的重投影误差（含 outlier，仅用于 avg_dist 参考）
+        dis_all = (pts1_batch - pts1_pred) ** 2
+        dis_all = np.sqrt(dis_all[:, 0] + dis_all[:, 1])
+        avg_dist = dis_all.mean()
 
-        # 3. 计算 avg_dist（用于 AUC）
-        dis = (pts1_batch - pts1_pred) ** 2
-        dis = np.sqrt(dis[:, 0] + dis[:, 1])
-        avg_dist = dis.mean()
+        # 【修复】mae/mee/MSE 只在 RANSAC inlier 点上计算
+        # 原因：RANSAC 拒绝的 outlier 点误差本来就很大，
+        # 用全部点的 dis.max() 会虚高，导致所有样本被误判为 Inaccurate
+        if inliers is not None and np.sum(inliers.ravel() > 0) > 0:
+            if len(bin_indices) >= 4:
+                # RANSAC 在 pts0_ransac = pts0_batch[bin_indices] 上运行
+                # inliers mask 指向 pts0_ransac，需映射回 pts0_batch
+                inlier_mask_ransac = inliers.ravel() > 0
+                inlier_global_indices = bin_indices[inlier_mask_ransac]
+                pts0_inlier = pts0_batch[inlier_global_indices]
+                pts1_inlier = pts1_batch[inlier_global_indices]
+            else:
+                inlier_mask_ransac = inliers.ravel() > 0
+                pts0_inlier = pts0_batch[inlier_mask_ransac]
+                pts1_inlier = pts1_batch[inlier_mask_ransac]
 
-        # 4. Inaccurate 判断：mae > 50 或 mee > 20
-        mae = dis.max()   # 最大误差
-        mee = np.median(dis)  # 中位误差
+            pts0_inlier_homo = pts0_inlier.reshape(-1, 1, 2).astype(np.float32)
+            pts1_inlier_pred = cv2.perspectiveTransform(pts0_inlier_homo, H_est).reshape(-1, 2)
+
+            # 计算 MSE（仅 inlier）
+            mse = np.mean((pts1_inlier - pts1_inlier_pred) ** 2)
+
+            # 计算 dis（仅 inlier），用于 mae/mee 判断
+            dis = (pts1_inlier - pts1_inlier_pred) ** 2
+            dis = np.sqrt(dis[:, 0] + dis[:, 1])
+        else:
+            # 无 inlier 时回退用全部点（此时 is_failed 应已为 True）
+            mse = np.mean((pts1_batch - pts1_pred) ** 2)
+            dis = dis_all
+
+        # 4. Inaccurate 判断：mae > 50 或 mee > 20（与 metrics_cau_principle_0305.md 对齐）
+        # 注意：此处 mae/mee 基于 RANSAC inlier 点，不再受 outlier 污染
+        mae = dis.max()   # 最大误差（inlier 点）
+        mee = np.median(dis)  # 中位误差（inlier 点）
         is_inaccurate = False
         if mae > 50.0 or mee > 20.0:
             _dual_log("WARNING", f"⚠️ Batch {bs}: Inaccurate (mae={mae:.2f}, mee={mee:.2f})")
