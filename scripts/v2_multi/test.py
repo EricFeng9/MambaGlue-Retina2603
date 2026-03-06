@@ -1024,6 +1024,10 @@ def parse_args():
     parser.add_argument('--test_datasets', '-d', type=str, default=None,
                         help='指定测试数据集，用逗号分隔，如 "CFFA,CFOCT,OCTFA" 或 "CFFA"')
 
+    # Baseline 模式：使用 SuperPoint 预训练权重 + 未训练的 MambaGlue（不加载 checkpoint）
+    parser.add_argument('--baseline', action='store_true',
+                        help='使用 SuperPoint 预训练权重 + 未训练 MambaGlue（不需要提供 checkpoint）')
+
     parser.add_argument('--name', '-n', type=str, required=True,
                         help='模型名称（用于定位结果目录）')
     parser.add_argument('--test_name', '-t', type=str, required=True,
@@ -1069,20 +1073,20 @@ def main():
     else:
         mode_dir = script_config['result_dir']
 
-    if args.checkpoint:
-        ckpt_path = Path(args.checkpoint)
-    else:
-        ckpt_path = Path(f"results/{mode_dir}/{args.name}/best_checkpoint/model.ckpt")
+    if not args.baseline:
+        if args.checkpoint:
+            ckpt_path = Path(args.checkpoint)
+        else:
+            ckpt_path = Path(f"results/{mode_dir}/{args.name}/best_checkpoint/model.ckpt")
 
-    if not ckpt_path.exists():
-        logger.error(f"检查点不存在: {ckpt_path}")
-        logger.info(f"请确保训练模型存在，或使用 --checkpoint 指定有效的检查点路径")
-        return
+        if not ckpt_path.exists():
+            logger.error(f"检查点不存在: {ckpt_path}")
+            logger.info(f"请确保训练模型存在，或使用 --checkpoint 指定有效的检查点路径")
+            return
 
-    logger.info(f"加载检查点: {ckpt_path}")
-
-    # 设置输出目录
-    output_dir = Path(f"results/{mode_dir}/{args.name}/{args.test_name}")
+    # 设置输出目录（baseline 模式加 _baseline 后缀）
+    test_name_suffix = f"{args.test_name}_baseline" if args.baseline else args.test_name
+    output_dir = Path(f"results/{mode_dir}/{args.name}/{test_name_suffix}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # 配置日志
@@ -1116,13 +1120,77 @@ def main():
     logger.info(f"输出目录: {output_dir}")
     logger.info(f"GPU配置: devices={gpus_list}, num_gpus={_n_gpus}")
 
-    # 从检查点加载模型
-    model = pl_class.load_from_checkpoint(
-        str(ckpt_path),
-        config=config,
-        result_dir=str(output_dir)
-    )
-    model.eval()
+    # 从检查点加载模型 或 使用 baseline（SuperPoint预训练 + 未训练MambaGlue）
+    if args.baseline:
+        logger.info("=" * 50)
+        logger.info("BASELINE 模式：SuperPoint 预训练权重 + 未训练 MambaGlue")
+        logger.info("=" * 50)
+
+        class BaselineMambaGlueModel(pl.LightningModule):
+            """Baseline 模型：SuperPoint 预训练权重 + MambaGlue 官方预训练权重（不加载任何训练 checkpoint）"""
+            def __init__(self, config):
+                super().__init__()
+                self.config = config
+
+                # 特征提取器 (SuperPoint) - 加载预训练权重，冻结
+                self.extractor = SuperPoint(max_num_keypoints=2048).eval()
+                sp_url = "https://github.com/cvg/LightGlue/releases/download/v0.1_arxiv/superpoint_v1.pth"
+                try:
+                    sp_state = torch.hub.load_state_dict_from_url(sp_url, map_location='cpu')
+                    self.extractor.load_state_dict(sp_state, strict=False)
+                    logger.info("成功加载 SuperPoint 预训练权重")
+                except Exception as e:
+                    logger.warning(f"加载 SuperPoint 预训练权重失败: {e}，使用随机初始化")
+                for param in self.extractor.parameters():
+                    param.requires_grad = False
+
+                # 匹配器 (MambaGlue) - 构造函数内部会自动尝试加载官方预训练权重
+                # (优先找 superpoint_mambaglue.tar，找不到则从 checkpoint_best.tar，
+                #  两者都不存在才随机初始化，详见 mambaglue/mambaglue.py L597-626)
+                mg_conf = config.MATCHING.copy()
+                self.matcher = MambaGlue(**mg_conf)
+                for param in self.matcher.parameters():
+                    param.requires_grad = False
+
+            def forward(self, batch):
+                with torch.no_grad():
+                    if 'keypoints0' not in batch:
+                        feats0 = self.extractor({'image': batch['image0']})
+                        feats1 = self.extractor({'image': batch['image1']})
+                        batch.update({
+                            'keypoints0': feats0['keypoints'],
+                            'descriptors0': feats0['descriptors'],
+                            'scores0': feats0['keypoint_scores'],
+                            'keypoints1': feats1['keypoints'],
+                            'descriptors1': feats1['descriptors'],
+                            'scores1': feats1['keypoint_scores']
+                        })
+
+                data = {
+                    'image0': {
+                        'keypoints': batch['keypoints0'],
+                        'descriptors': batch['descriptors0'],
+                        'image': batch['image0']
+                    },
+                    'image1': {
+                        'keypoints': batch['keypoints1'],
+                        'descriptors': batch['descriptors1'],
+                        'image': batch['image1']
+                    }
+                }
+                return self.matcher(data)
+
+        model = BaselineMambaGlueModel(config)
+        model.eval()
+        logger.info("Baseline 模型已准备就绪（SuperPoint预训练 + MambaGlue官方预训练权重）")
+    else:
+        logger.info(f"加载检查点: {ckpt_path}")
+        model = pl_class.load_from_checkpoint(
+            str(ckpt_path),
+            config=config,
+            result_dir=str(output_dir)
+        )
+        model.eval()
 
     # 初始化测试数据模块
     test_dm = TestDataModule(args)
@@ -1169,6 +1237,7 @@ def main():
         f.write(f"Train Script: {args.train_script}\n")
         if args.train_script == 'train_onPureGen_v2':
             f.write(f"Train Mode: {args.train_mode}\n")
+        f.write(f"Mode: {'BASELINE (SuperPoint pretrained + MambaGlue random init)' if args.baseline else 'Checkpoint'}\n")
         f.write(f"Test Name: {args.test_name}\n")
         f.write(f"Model Name: {args.name}\n")
         if args.test_datasets:
