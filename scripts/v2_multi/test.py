@@ -1200,6 +1200,17 @@ def main():
         )
         model.eval()
 
+    # 将模型移到指定 GPU（baseline 模式手动创建的模型默认在 CPU，
+    # selective_scan_cuda 要求张量必须在 CUDA 上）
+    if isinstance(gpus_list, list) and len(gpus_list) > 0:
+        device = torch.device(f'cuda:{gpus_list[0]}')
+    elif torch.cuda.is_available():
+        device = torch.device('cuda:0')
+    else:
+        device = torch.device('cpu')
+    model = model.to(device)
+    logger.info(f"模型已移到设备: {device}")
+
     # 初始化测试数据模块
     test_dm = TestDataModule(args)
 
