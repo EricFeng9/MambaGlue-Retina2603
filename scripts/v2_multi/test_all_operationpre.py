@@ -1,5 +1,5 @@
 """
-针对 train_onMultiGen_vessels_enhanced_mambaglue.py 训练权重的测试脚本
+针对 train_onMultiGen_vessels_enhanced.py 训练权重的测试脚本
 
 测试内容：
 - 使用 --name 指定的权重，对三个数据集全量数据（train+val 合并）做测试
@@ -527,9 +527,9 @@ class BaselineMambaGlueModel(pl.LightningModule):
 
 
 def load_trained_model(ckpt_path, config, output_dir):
-    """加载 train_onMultiGen_vessels_enhanced_mambaglue 训练的模型"""
+    """加载 train_onMultiGen_vessels_enhanced 训练的模型"""
     import importlib
-    module = importlib.import_module('scripts.v2_multi.train_onMultiGen_vessels_enhanced_mambaglue')
+    module = importlib.import_module('scripts.v2_multi.train_onMultiGen_vessels_enhanced')
     pl_class = getattr(module, 'PL_MambaGlue_Gen')
     model = pl_class.load_from_checkpoint(
         str(ckpt_path),
@@ -677,7 +677,7 @@ def print_comparison_table(trained_results, baseline_results=None):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="针对 train_onMultiGen_vessels_enhanced_mambaglue 权重的测试脚本（三个全量数据集）"
+        description="针对 train_onMultiGen_vessels_enhanced 权重的测试脚本（三个全量数据集）"
     )
     parser.add_argument('--name', '-n', type=str, required=True,
                         help='模型名称（results/mambaglue_gen/<name>/best_checkpoint/model.ckpt）')
@@ -734,7 +734,7 @@ def main():
 
     # 获取配置
     import importlib
-    module = importlib.import_module('scripts.v2_multi.train_onMultiGen_vessels_enhanced_mambaglue')
+    module = importlib.import_module('scripts.v2_multi.train_onMultiGen_vessels_enhanced')
     get_default_config = getattr(module, 'get_default_config')
     config = get_default_config()
     pl.seed_everything(config.TRAINER.SEED)
