@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import sys
 import os
 import shutil
@@ -366,7 +365,7 @@ class PL_MambaGlue_Gen(pl.LightningModule):
         self.vessel_loss_weight = 10.0
         
         # 使用统一的评估器
-        self.evaluator = UnifiedEvaluator(config=config)
+        self.evaluator = UnifiedEvaluator(mode='gen', config=config)
 
     def configure_optimizers(self):
         """配置优化器和学习率调度器"""

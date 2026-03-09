@@ -42,8 +42,8 @@ from data.operation_pre_filtered_cffa.operation_pre_filtered_cffa_dataset import
 from data.operation_pre_filtered_cfoct.operation_pre_filtered_cfoct_dataset import CFOCTDataset
 from data.operation_pre_filtered_octfa.operation_pre_filtered_octfa_dataset import OCTFADataset
 
-# 导入指标计算模块（v2版本，对齐 metrics_cau_principle_0304.md）
-from scripts.v2.metrics import (
+# 导入指标计算模块（v2_multi版本，对齐 metrics_cau_principle_0305.md）
+from scripts.v2_multi.metrics import (
     compute_homography_errors,
     aggregate_metrics,
     set_metrics_verbose,
@@ -634,7 +634,7 @@ class PL_MambaGlue_Gen(pl.LightningModule):
         if self._val_step_errors and len(self._val_step_errors) > 0:
             # 使用 metrics.py 的 error_auc 函数计算 AUC@5, AUC@10, AUC@20
             # 【关键修改】对所有误差一起计算 AUC，而不是对每个 batch 分别计算后取平均
-            from scripts.v2.metrics import error_auc, compute_auc_rop
+            from scripts.v2_multi.metrics import error_auc, compute_auc_rop
             auc_dict = error_auc(self._val_step_errors, [5, 10, 20])
             auc5_mean = auc_dict.get('auc@5', 0.0)
             auc10_mean = auc_dict.get('auc@10', 0.0)
@@ -831,8 +831,8 @@ class MultimodalValidationCallback(Callback):
         # 【关键修改】直接从 metrics_batch 获取 MSE 和 MACE，而不是自己计算
         # metrics.py 按照 metrics_cau_principle_0304.md 计算：
         # - mse/mace: 仅包含 Acceptable 样本（mae ≤ 50 且 mee ≤ 20），其他为 inf
-        mse_list = metrics_batch.get('mse', [])
-        mace_list = metrics_batch.get('mace', [])
+        mse_list = metrics_batch.get('mse_list', [])
+        mace_list = metrics_batch.get('mace_list', [])
         auc_error_list = metrics_batch.get('auc_error', [])
         
         failed_samples = 0

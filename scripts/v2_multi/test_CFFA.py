@@ -29,8 +29,8 @@ from mambaglue import viz2d
 # 导入 CFFA 数据集（使用新的 cffa_dataset.py）
 from data.CFFA.cffa_dataset import CFFADataset
 
-# 导入指标计算模块（v2版本，对齐 metrics_cau_principle_0304.md）
-from scripts.v2.metrics import (
+# 导入指标计算模块（v2_multi版本，对齐 metrics_cau_principle_0305.md）
+from scripts.v2_multi.metrics import (
     compute_homography_errors,
     aggregate_metrics,
     set_metrics_verbose,

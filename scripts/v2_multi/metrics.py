@@ -96,7 +96,9 @@ def compute_symmetrical_epipolar_errors(data):
         data (dict):{"epi_errs": [M]}
     """
     dataset_name = data['dataset_name'][0].lower()
-    if dataset_name == 'multimodal' or dataset_name == 'realdataset':
+    # 【修复】必须包含所有医学眼底数据集名称
+    multimodal_datasets = ['multimodal', 'realdataset', 'cffa', 'cfoct', 'octfa', 'cfocta']
+    if dataset_name in multimodal_datasets:
         return compute_homography_reprojection_errors(data)
     
     Tx = numeric.cross_product_matrix(data['T_0to1'][:, :3, 3])
@@ -188,12 +190,20 @@ def compute_pose_errors(data, config):
         }
     """
     dataset_name = data['dataset_name'][0].lower()
-    if dataset_name == 'multimodal' or dataset_name == 'realdataset':
+    # 【修复】必须包含所有医学眼底数据集名称
+    multimodal_datasets = ['multimodal', 'realdataset', 'cffa', 'cfoct', 'octfa', 'cfocta']
+    if dataset_name in multimodal_datasets:
         return compute_homography_errors(data, config)
     
     pixel_thr = config.TRAINER.RANSAC_PIXEL_THR  # 0.5
     conf = config.TRAINER.RANSAC_CONF  # 0.99999
-    data.update({'R_errs': [], 't_errs': [], 'inliers': []})
+    data.update({
+        'R_errs': [],
+        't_errs': [],
+        'inliers': [],
+        'failed_mask': [],
+        'inaccurate_mask': [],
+    })
 
     m_bids = data['m_bids'].cpu().numpy()
     pts0 = data['mkpts0_f'].cpu().numpy()
@@ -255,7 +265,18 @@ def compute_homography_errors(data, config):
     计算单应矩阵估计误差 (针对 MultiModal 数据集)
     完全对齐 metrics_cau_principle_0304.md 的指标计算原则
     """
-    data.update({'R_errs': [], 't_errs': [], 'inliers': [], 'H_est': [], 'mse': [], 'mace': [], 'avg_dist': [], 'auc_error': []})
+    data.update({
+        'R_errs': [],
+        't_errs': [],
+        'inliers': [],
+        'H_est': [],
+        'mse_list': [],
+        'mace_list': [],
+        'avg_dist': [],
+        'auc_error': [],
+        'failed_mask': [],
+        'inaccurate_mask': [],
+    })
 
     m_bids = data['m_bids'].cpu().numpy() if torch.is_tensor(data['m_bids']) else data['m_bids']
     pts0 = data['mkpts0_f'].cpu().numpy() if torch.is_tensor(data['mkpts0_f']) else data['mkpts0_f']
@@ -271,12 +292,13 @@ def compute_homography_errors(data, config):
 
         if num_matches < 4:
             _dual_log("WARNING", f"⚠️ Batch {bs}: 匹配点数不足 ({num_matches} < 4)")
-            data['R_errs'].append(np.inf)
-            data['t_errs'].append(np.inf)
+            # 【修复】Failed 样本：R_errs=0.0, t_errs=1e6（用于AUC计算）
+            data['R_errs'].append(0.0)
+            data['t_errs'].append(1e6)
             data['inliers'].append(np.array([]).astype(bool))
             data['H_est'].append(np.eye(3))
-            data['mse'].append(np.inf)
-            data['mace'].append(np.inf)
+            data['mse_list'].append(np.inf)
+            data['mace_list'].append(np.inf)
             data['avg_dist'].append(1e6)
             data['auc_error'].append(1e6)  # Failed 样本：纳入 AUC 计算
             continue
@@ -301,12 +323,13 @@ def compute_homography_errors(data, config):
 
         if H_est is None:
             _dual_log("WARNING", f"⚠️ Batch {bs}: RANSAC 返回 None (匹配点数: {len(bin_indices) if len(bin_indices) >= 4 else num_matches})")
-            data['R_errs'].append(np.inf)
-            data['t_errs'].append(np.inf)
+            # 【修复】Failed 样本：R_errs=0.0, t_errs=1e6（用于AUC计算）
+            data['R_errs'].append(0.0)
+            data['t_errs'].append(1e6)
             data['inliers'].append(np.array([]).astype(bool))
             data['H_est'].append(np.eye(3))
-            data['mse'].append(np.inf)
-            data['mace'].append(np.inf)
+            data['mse_list'].append(np.inf)
+            data['mace_list'].append(np.inf)
             data['avg_dist'].append(1e6)
             data['auc_error'].append(1e6)  # Failed 样本：纳入 AUC 计算
             continue
@@ -341,6 +364,8 @@ def compute_homography_errors(data, config):
         avg_dist = dis.mean()
 
         # 4. Inaccurate 判断（对齐 principle 3.4：mae > 50 或 mee > 20）
+        # 注意：Inaccurate 看的是【匹配点】的 max/median；AUC 看的是【四角点】的 mace。
+        # 因此可能出现「全部 Inaccurate 但 AUC 较高」：角点误差小、匹配点存在 outlier 或中位数偏高。
         mae = dis.max()
         mee = np.median(dis)
         is_inaccurate = False
@@ -372,17 +397,21 @@ def compute_homography_errors(data, config):
 
         # MSE/MACE：仅统计 Acceptable 样本（mae ≤ 50 且 mee ≤ 20）
         if is_failed or is_inaccurate:
-            data['mse'].append(np.inf)
-            data['mace'].append(np.inf)
+            data['mse_list'].append(np.inf)
+            data['mace_list'].append(np.inf)
         else:
-            data['mse'].append(mse)
-            data['mace'].append(mace)
+            data['mse_list'].append(mse)
+            data['mace_list'].append(mace)
 
         # 保存 R_errs / t_errs（用于兼容性，t_errs 使用 MACE）
         data['R_errs'].append(0.0)
         data['t_errs'].append(mace)
         data['inliers'].append(inliers.ravel() > 0 if inliers is not None else np.array([]).astype(bool))
         data['H_est'].append(H_est)
+
+        # 保存 failed_mask 和 inaccurate_mask（供 test_all_operationpre 使用）
+        data['failed_mask'].append(is_failed)
+        data['inaccurate_mask'].append(is_inaccurate)
 
 
 # --- METRIC AGGREGATION ---
