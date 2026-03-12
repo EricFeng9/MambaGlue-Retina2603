@@ -7,6 +7,9 @@ from kornia.geometry.epipolar import numeric
 from kornia.geometry.conversions import convert_points_to_homogeneous
 import sys
 import os
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 # 【终极方案】创建一个同时输出到控制台和文件的日志函数
 _log_file = None
@@ -220,6 +223,73 @@ def compute_pose_errors(data, config):
             data['R_errs'].append(R_err)
             data['t_errs'].append(t_err)
             data['inliers'].append(inliers)
+
+
+def visualize_T_0to1_check(fix_img, moving_img, gt_pts0, gt_pts1, T_0to1_mov2fix, save_path):
+    """
+    可视化 T_0to1 变换矩阵的正确性验证。
+    
+    Args:
+        fix_img:    numpy [H, W], uint8, fix 图像 (512x512)
+        moving_img: numpy [H, W], uint8, moving 图像 (512x512)
+        gt_pts0:    numpy [N, 2], fix 图上的 GT 关键点 (512 空间)
+        gt_pts1:    numpy [N, 2], moving 图上的 GT 关键点 (512 空间)
+        T_0to1_mov2fix: numpy [3, 3], moving → fix 变换矩阵 (512 空间)
+                        即数据集 __getitem__ 直接返回的 T_0to1
+        save_path:  str, 保存路径
+    """
+    if gt_pts0 is None or gt_pts1 is None or len(gt_pts0) == 0 or len(gt_pts1) == 0:
+        return
+    
+    # 确保 numpy 格式
+    if isinstance(gt_pts0, torch.Tensor):
+        gt_pts0 = gt_pts0.cpu().numpy()
+    if isinstance(gt_pts1, torch.Tensor):
+        gt_pts1 = gt_pts1.cpu().numpy()
+    if isinstance(T_0to1_mov2fix, torch.Tensor):
+        T_0to1_mov2fix = T_0to1_mov2fix.cpu().numpy()
+    
+    N = min(len(gt_pts0), len(gt_pts1))
+    pts1 = gt_pts1[:N]  # moving 上的 GT 关键点
+    pts0 = gt_pts0[:N]  # fix 上的 GT 关键点
+    
+    # 用 T_0to1 (moving→fix) 将 moving 关键点投影到 fix 空间
+    pts1_h = np.concatenate([pts1, np.ones((N, 1))], axis=1)  # [N, 3]
+    pts1_proj = (T_0to1_mov2fix @ pts1_h.T).T  # [N, 3]
+    pts1_proj = pts1_proj[:, :2] / (pts1_proj[:, 2:] + 1e-8)  # [N, 2]
+    
+    # 计算投影误差
+    errors = np.sqrt(np.sum((pts1_proj - pts0) ** 2, axis=1))
+    mean_err = np.mean(errors)
+    max_err = np.max(errors)
+    
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    
+    # 左图: fix 图 + GT关键点(绿) + moving投影点(红)
+    axes[0].imshow(fix_img, cmap='gray')
+    axes[0].scatter(pts0[:, 0], pts0[:, 1], c='lime', s=30, marker='o', label='gt_pts0 (fix GT)', zorder=5)
+    axes[0].scatter(pts1_proj[:, 0], pts1_proj[:, 1], c='red', s=30, marker='x', label='gt_pts1 projected', zorder=5)
+    axes[0].set_title(f'Fix image\nmean_err={mean_err:.2f}px, max_err={max_err:.2f}px')
+    axes[0].legend(fontsize=8)
+    
+    # 中图: moving 图 + GT关键点(绿)
+    axes[1].imshow(moving_img, cmap='gray')
+    axes[1].scatter(pts1[:, 0], pts1[:, 1], c='lime', s=30, marker='o', label='gt_pts1 (moving GT)', zorder=5)
+    axes[1].set_title('Moving image')
+    axes[1].legend(fontsize=8)
+    
+    # 右图: 逐点误差柱状图
+    axes[2].bar(range(N), errors, color='steelblue')
+    axes[2].axhline(y=mean_err, color='red', linestyle='--', label=f'mean={mean_err:.2f}px')
+    axes[2].set_xlabel('Keypoint index')
+    axes[2].set_ylabel('Projection error (px)')
+    axes[2].set_title('Per-point projection error')
+    axes[2].legend(fontsize=8)
+    
+    plt.suptitle('T_0to1 Verification (moving→fix projection)', fontsize=14)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=100, bbox_inches='tight')
+    plt.close(fig)
 
 
 def spatial_binning(pts0, pts1, img_size, grid_size=4, top_n=20, conf=None):

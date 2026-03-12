@@ -1,0 +1,5 @@
+config: 'namespace(MATCHING={''features'': ''superpoint'', ''input_dim'': 256, ''descriptor_dim'':
+  256, ''depth_confidence'': -1, ''width_confidence'': -1, ''filter_threshold'': 0.1,
+  ''flash'': False}, TRAINER=namespace(CANONICAL_BS=4, CANONICAL_LR=0.0001, PATIENCE=10,
+  PLOT_MODE=''evaluation'', RANSAC_PIXEL_THR=3.0, SEED=66, TRUE_BATCH_SIZE=4, TRUE_LR=0.0001,
+  WORLD_SIZE=1))'

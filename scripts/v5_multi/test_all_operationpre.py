@@ -34,7 +34,8 @@ from scripts.v5_multi.metrics import (
     compute_homography_errors,
     set_metrics_verbose,
     error_auc,
-    compute_auc_rop
+    compute_auc_rop,
+    visualize_T_0to1_check
 )
 
 from dataset.operation_pre_filtered_cffa.operation_pre_filtered_cffa_dataset import CFFADataset
@@ -490,6 +491,27 @@ def _visualize_samples(batch, outputs, output_dir, batch_idx, viz_counters, max_
             cv2.imwrite(str(save_path / "chessboard_gt_vs_pred.png"), create_chessboard(img1_gt, img1_result))
         except Exception:
             pass
+        
+        # T_0to1 验证可视化（必须输出）
+        try:
+            gt_pts0 = batch.get('gt_pts0', None)
+            gt_pts1 = batch.get('gt_pts1', None)
+            if gt_pts0 is not None and gt_pts1 is not None:
+                # batch 中的 T_0to1 已经是 fix→moving（Wrapper 取了逆）
+                # 需要再取逆回 moving→fix 才能用于验证
+                T_fix_to_moving = batch['T_0to1'][sample_idx].cpu().numpy()
+                T_mov_to_fix = np.linalg.inv(T_fix_to_moving)
+                
+                visualize_T_0to1_check(
+                    fix_img=img0,
+                    moving_img=img1,
+                    gt_pts0=gt_pts0[sample_idx] if isinstance(gt_pts0, list) else gt_pts0[sample_idx].cpu().numpy(),
+                    gt_pts1=gt_pts1[sample_idx] if isinstance(gt_pts1, list) else gt_pts1[sample_idx].cpu().numpy(),
+                    T_0to1_mov2fix=T_mov_to_fix,
+                    save_path=str(save_path / 'T_0to1_check.png')
+                )
+        except Exception as e:
+            logger.warning(f"T_0to1 验证可视化失败: {e}")
 
         if 'mses' in outputs and sample_idx < len(outputs['mses']):
             with open(save_path / "metrics.txt", "w") as f:

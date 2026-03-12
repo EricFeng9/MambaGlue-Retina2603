@@ -49,6 +49,7 @@ from dataset.operation_pre_filtered_octfa.operation_pre_filtered_octfa_dataset i
 
 # 导入统一的测试/验证模块（使用 v5_multi 版本，与 metrics 保持一致）
 from scripts.v5_multi.test import UnifiedEvaluator
+from scripts.v5_multi.metrics import visualize_T_0to1_check
 
 # ==========================================
 # 配置函数
@@ -702,6 +703,28 @@ class PL_MambaGlue_Gen(pl.LightningModule):
             cb_fix_orig_mov_gt = create_chessboard(img1_gt, img0_origin, grid_size=4)
             cv2.imwrite(str(sample_dir / 'chessboard_fix_origin_vs_moving_gt.png'), cb_fix_orig_mov_gt)
             
+            # T_0to1 验证可视化（如果有 GT 关键点）
+            # 注意：生成数据集可能没有 GT 关键点，此时跳过
+            gt_pts0 = batch.get('gt_pts0', None)
+            gt_pts1 = batch.get('gt_pts1', None)
+            if gt_pts0 is not None and gt_pts1 is not None:
+                try:
+                    # batch 中的 T_0to1 已经是 fix→moving（Wrapper 取了逆）
+                    # 需要再取逆回 moving→fix 才能用于验证
+                    T_fix_to_moving = batch['T_0to1'][i].cpu().numpy()
+                    T_mov_to_fix = np.linalg.inv(T_fix_to_moving)
+                    
+                    visualize_T_0to1_check(
+                        fix_img=img0,
+                        moving_img=img1,
+                        gt_pts0=gt_pts0[i] if isinstance(gt_pts0, list) else gt_pts0[i].cpu().numpy(),
+                        gt_pts1=gt_pts1[i] if isinstance(gt_pts1, list) else gt_pts1[i].cpu().numpy(),
+                        T_0to1_mov2fix=T_mov_to_fix,
+                        save_path=str(sample_dir / 'T_0to1_check.png')
+                    )
+                except Exception as e:
+                    logger.warning(f"T_0to1 验证可视化失败: {e}")
+            
             logger.info(f"已保存训练可视化: {sample_dir}")
         
         logger.info(f"Batch {batch_idx} 可视化完成，共 {batch_size} 个样本")
@@ -1002,6 +1025,27 @@ class MultimodalValidationCallback(Callback):
             cv2.imwrite(str(save_path / "chessboard.png"), cb)
         except:
             pass
+        
+        # T_0to1 验证可视化（必须输出）
+        try:
+            gt_pts0 = batch.get('gt_pts0', None)
+            gt_pts1 = batch.get('gt_pts1', None)
+            if gt_pts0 is not None and gt_pts1 is not None:
+                # batch 中的 T_0to1 已经是 fix→moving（Wrapper 取了逆）
+                # 需要再取逆回 moving→fix 才能用于验证
+                T_fix_to_moving = batch['T_0to1'][sample_idx].cpu().numpy()
+                T_mov_to_fix = np.linalg.inv(T_fix_to_moving)
+                
+                visualize_T_0to1_check(
+                    fix_img=img0,
+                    moving_img=img1,
+                    gt_pts0=gt_pts0[sample_idx] if isinstance(gt_pts0, list) else gt_pts0[sample_idx].cpu().numpy(),
+                    gt_pts1=gt_pts1[sample_idx] if isinstance(gt_pts1, list) else gt_pts1[sample_idx].cpu().numpy(),
+                    T_0to1_mov2fix=T_mov_to_fix,
+                    save_path=str(save_path / 'T_0to1_check.png')
+                )
+        except Exception as e:
+            logger.warning(f"T_0to1 验证可视化失败: {e}")
 
 # ==========================================
 # 课程学习调度器
