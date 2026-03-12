@@ -337,13 +337,13 @@ class UnifiedEvaluator:
         self.total_samples += B
 
         # 【修复】使用 metrics_batch 中的 auc_error 和 mse/mace 来判断样本状态
-        # metrics.py 中：
+        # metrics.py 中：键名为 mse_list / mace_list（与 metrics_cau_principle_0309 一致）
         # - Failed: auc_error = 1e6
         # - Success (包括 inaccurate): auc_error = mace (有限值)
-        # - Inaccurate: mse = inf
-        # - Acceptable: mse = 有限值
+        # - Inaccurate: mse_list[i] = inf
+        # - Acceptable: mse_list[i] = 有限值
         auc_error_list = metrics_batch.get('auc_error', [])
-        mse_list = metrics_batch.get('mse', [])
+        mse_list = metrics_batch.get('mse_list', metrics_batch.get('mse', []))
 
         failed_count = 0
         inaccurate_count = 0
@@ -370,11 +370,13 @@ class UnifiedEvaluator:
         self.inaccurate_samples += inaccurate_count
         self.acceptable_samples += acceptable_count
 
-        if len(metrics_batch.get('auc_error', [])) > 0:
-            self.all_errors.extend(list(metrics_batch['auc_error']))
+        # AUC 依据：优先 auc_error（Failed=1e6, Success=mace），若无则用 t_errs（兼容旧 metrics）
+        errs_for_auc = metrics_batch.get('auc_error', metrics_batch.get('t_errs', []))
+        if len(errs_for_auc) > 0:
+            self.all_errors.extend(list(errs_for_auc))
 
-        batch_mses = list(metrics_batch.get('mse', []))
-        batch_maces = list(metrics_batch.get('mace', []))
+        batch_mses = list(metrics_batch.get('mse_list', metrics_batch.get('mse', [])))
+        batch_maces = list(metrics_batch.get('mace_list', metrics_batch.get('mace', [])))
         for mse in batch_mses:
             if np.isfinite(mse):
                 self.all_mses.append(float(mse))
@@ -740,15 +742,18 @@ class PL_MambaGlue(pl.LightningModule):
         while len(H_ests) < B:
             H_ests.append(np.eye(3))  # 填充单位矩阵
 
-        if len(metrics_batch.get('auc_error', [])) > 0:
-            self._test_step_errors.extend(metrics_batch['auc_error'])
+        errs_for_auc = metrics_batch.get('auc_error', metrics_batch.get('t_errs', []))
+        if len(errs_for_auc) > 0:
+            self._test_step_errors.extend(errs_for_auc)
 
-        if len(metrics_batch.get('mse', [])) > 0:
-            for m in metrics_batch['mse']:
+        batch_mse = metrics_batch.get('mse_list', metrics_batch.get('mse', []))
+        batch_mace = metrics_batch.get('mace_list', metrics_batch.get('mace', []))
+        if len(batch_mse) > 0:
+            for m in batch_mse:
                 if not np.isinf(m):
                     self._test_step_mse.append(m)
-        if len(metrics_batch.get('mace', [])) > 0:
-            for m in metrics_batch['mace']:
+        if len(batch_mace) > 0:
+            for m in batch_mace:
                 if not np.isinf(m):
                     self._test_step_mace.append(m)
 
@@ -890,13 +895,10 @@ class TestCallback(Callback):
         H_ests = outputs.get('H_est', [np.eye(3)] * batch_size)
         metrics_batch = outputs.get('metrics_batch', {})
 
-        # 直接使用 metrics.py 计算的 avg_dist 来判断 failed/inaccurate
-        # metrics.py 中：
-        # - Failed: avg_dist = 1e6
-        # - Success (包括 inaccurate): avg_dist = 实际计算的 avg_dist
-        mse_list = metrics_batch.get('mse', [])
-        mace_list = metrics_batch.get('mace', [])
-        auc_error_list = metrics_batch.get('auc_error', [])
+        # 直接使用 metrics.py 结果；键名为 mse_list/mace_list（与 metrics.py 一致）
+        mse_list = metrics_batch.get('mse_list', metrics_batch.get('mse', []))
+        mace_list = metrics_batch.get('mace_list', metrics_batch.get('mace', []))
+        auc_error_list = metrics_batch.get('auc_error', metrics_batch.get('t_errs', []))
 
         for i in range(batch_size):
             self.total_samples += 1
