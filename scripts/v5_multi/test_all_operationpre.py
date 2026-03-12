@@ -1,9 +1,9 @@
 """
-针对 train_onMultiGen_vessels_enhanced.py 训练权重的测试脚本
+针对 train_onMultiGen_vessels.py 训练权重的测试脚本
 
 测试内容：
 - 使用 --name 指定的权重，对三个数据集全量数据（train+val 合并）做测试
-- --baseline 模式：额外运行 LightGlue 原生预训练权重作为基准
+- --baseline 模式：额外运行 MambaGlue 原生预训练权重作为基准
 - 最终输出三个数据集上、生成数据训练 vs baseline 的对比表格（CSV）
 - 每个数据集输出 5 个样本可视化结果
 """
@@ -23,14 +23,14 @@ import csv
 # 添加父目录到 sys.path
 # 先添加项目根目录，以便导入 dataset 模块
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../..'))
-# 再添加 LightGlue 目录，以便导入 lightglue 模块
+# 再添加 MambaGlue 目录，以便导入 mambaglue 模块
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
 from mambaglue import MambaGlue
 from mambaglue.superpoint import SuperPoint
 
-# 导入 metrics（使用 v2_multi 版本的 metrics，与训练保持一致）
-from scripts.v2_multi.metrics import (
+# 导入 metrics（使用 v5_multi 版本的 metrics，与训练保持一致）
+from scripts.v5_multi.metrics import (
     compute_homography_errors,
     set_metrics_verbose,
     error_auc,
@@ -185,7 +185,6 @@ def build_full_dataset(dataset_cls, root_dir, mode, dataset_name):
 
 def build_all_dataloaders(args):
     """返回 {dataset_name: DataLoader} 字典，每个数据集独立一个 DataLoader"""
-    script_dir = Path(__file__).parent.parent.parent
 
     loader_params = {
         'batch_size': args.batch_size,
@@ -194,9 +193,9 @@ def build_all_dataloaders(args):
         'shuffle': False,
     }
 
-    cffa_dir = script_dir.parent / 'dataset' / 'operation_pre_filtered_cffa'
-    cfoct_dir = script_dir.parent / 'dataset' / 'operation_pre_filtered_cfoct'
-    octfa_dir = script_dir.parent / 'dataset' / 'operation_pre_filtered_octfa'
+    cffa_dir = '/data/student/Fengjunming/diffusion_registration/dataset/operation_pre_filtered_cffa'
+    cfoct_dir = '/data/student/Fengjunming/diffusion_registration/dataset/operation_pre_filtered_cfoct'
+    octfa_dir = '/data/student/Fengjunming/diffusion_registration/dataset/operation_pre_filtered_octfa'
 
     datasets = {
         'CFFA': build_full_dataset(CFFADataset, cffa_dir, 'fa2cf', 'CFFA'),
@@ -561,9 +560,9 @@ def run_evaluation_per_dataset(model, dataloaders, config, save_visualizations=F
 # 模型加载
 # ---------------------------------------------------------------------------
 
-class BaselineLightGlueModel(pl.LightningModule):
-    """使用 LightGlue 原生预训练权重的 baseline 模型"""
-    def __init__(self, config):
+class BaselineMambaGlueModel(pl.LightningModule):
+    """使用 MambaGlue 原生预训练权重的 baseline 模型"""
+    def __init__(self, config, pretrained_path):
         super().__init__()
         self.config = config
         self.extractor = SuperPoint(max_num_keypoints=2048).eval()
@@ -571,10 +570,49 @@ class BaselineLightGlueModel(pl.LightningModule):
             param.requires_grad = False
 
         lg_conf = config.MATCHING.copy()
-        lg_conf['weights'] = 'superpoint_mambaglue'
-        self.matcher = MambaGlue(**lg_conf).eval()
+        self.matcher = MambaGlue(**lg_conf)
+
+        # 强制加载预训练权重，strict=False 允许部分匹配
+        try:
+            ckpt = torch.load(pretrained_path, map_location='cpu', weights_only=False)
+            if 'model' in ckpt:
+                state_dict = ckpt['model']
+            else:
+                state_dict = ckpt
+            
+            # 关键：预训练权重键名需要映射才能匹配模型
+            # 参考 MambaGlue 类内部的 state_dict 处理逻辑
+            # 1. 移除 "matcher." 前缀
+            state_dict = {k.replace("matcher.", ""): v for k, v in state_dict.items()}
+            # 2. 移除 "extractor" 前缀
+            state_dict = {k.replace("extractor", ""): v for k, v in state_dict.items()}
+            # 3. transformers -> transformermambas (模块重命名)
+            state_dict = {k.replace("transformers.", "transformermambas."): v for k, v in state_dict.items()}
+            # 4. mamba_self_attn -> mamba_selfattn_mixer (子模块重命名)
+            state_dict = {k.replace("mamba_self_attn.", "mamba_selfattn_mixer."): v for k, v in state_dict.items()}
+            
+            # 使用 strict=False 允许部分权重差异
+            missing_keys, unexpected_keys = self.matcher.load_state_dict(state_dict, strict=False)
+            
+            # 检查是否有任何权重被成功加载
+            matched_keys = set(state_dict.keys()) - set(unexpected_keys)
+            if len(matched_keys) == 0:
+                raise RuntimeError("预训练权重加载失败：没有任何权重被成功匹配！请检查预训练权重文件格式。")
+            
+            if missing_keys:
+                logger.warning(f"预训练权重中缺失的键: {missing_keys}")
+            if unexpected_keys:
+                logger.warning(f"预训练权重中多余的键: {unexpected_keys}")
+            logger.info(f"成功加载 MambaGlue 预训练权重: {pretrained_path}")
+            logger.info(f"成功匹配 {len(matched_keys)}/{len(state_dict)} 个权重键")
+        except RuntimeError as e:
+            raise RuntimeError(f"加载 MambaGlue 预训练权重失败: {e}")
+        except Exception as e:
+            raise RuntimeError(f"加载 MambaGlue 预训练权重失败: {e}")
+
         for param in self.matcher.parameters():
             param.requires_grad = False
+        self.matcher.eval()
 
     def forward(self, batch):
         with torch.no_grad():
@@ -605,14 +643,17 @@ class BaselineLightGlueModel(pl.LightningModule):
 
 
 def load_trained_model(ckpt_path, config, output_dir):
-    """加载 train_onMultiGen_vessels_enhanced 训练的模型"""
+    """加载 train_onMultiGen_vessels 训练的模型"""
     import importlib
-    module = importlib.import_module('scripts.v2_multi.train_onMultiGen_vessels_enhanced')
-    pl_class = getattr(module, 'PL_LightGlue_Gen')
+    module = importlib.import_module('scripts.v5_multi.train_onMultiGen_vessels')
+    pl_class = getattr(module, 'PL_MambaGlue_Gen')
+    # 从 checkpoint 加载时，跳过预训练权重加载
+    # 因为训练好的权重已经在 checkpoint 中
     model = pl_class.load_from_checkpoint(
         str(ckpt_path),
         config=config,
         result_dir=str(output_dir),
+        skip_pretrained_load=True,
     )
     model.eval()
     return model
@@ -761,16 +802,19 @@ def print_comparison_table(trained_results, baseline_results=None):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="针对 train_onMultiGen_vessels_enhanced 权重的测试脚本（三个全量数据集）"
+        description="针对 train_onMultiGen_vessels 权重的测试脚本（三个全量数据集）"
     )
     parser.add_argument('--name', '-n', type=str, required=True,
-                        help='模型名称（results/lightglue_gen/<name>/best_checkpoint/model.ckpt）')
+                        help='模型名称（results/mambaglue_gen/<name>/best_checkpoint/model.ckpt）')
     parser.add_argument('--test_name', '-t', type=str, required=True,
-                        help='测试名称（结果保存在 results/lightglue_gen/<name>/<test_name>/）')
+                        help='测试名称（结果保存在 results/mambaglue_gen/<name>/<test_name>/）')
     parser.add_argument('--checkpoint', '-c', type=str, default=None,
-                        help='检查点路径（默认 results/lightglue_gen/<name>/best_checkpoint/model.ckpt）')
+                        help='检查点路径（默认 results/mambaglue_gen/<name>/best_checkpoint/model.ckpt）')
     parser.add_argument('--baseline', action='store_true',
-                        help='额外运行 LightGlue 原生预训练权重作为 baseline 并输出对比表格')
+                        help='额外运行 MambaGlue 原生预训练权重作为 baseline 并输出对比表格')
+    parser.add_argument('--mambaglue_pretrained', type=str,
+                        default='/data/student/Fengjunming/diffusion_registration/MambaGlue-Retina2603/superpoint_mambaglue.tar',
+                        help='MambaGlue 原生预训练权重路径 (仅 --baseline 模式使用)')
     parser.add_argument('--batch_size', type=int, default=4, help='批次大小')
     parser.add_argument('--num_workers', type=int, default=0, help='数据加载线程数')
     parser.add_argument('--seed', type=int, default=None, help='随机种子（不指定则自动生成）')
@@ -807,7 +851,7 @@ def main():
     if args.checkpoint:
         ckpt_path = Path(args.checkpoint)
     else:
-        ckpt_path = Path(f"results/lightglue_gen/{args.name}/best_checkpoint/model.ckpt")
+        ckpt_path = Path(f"results/mambaglue_gen/{args.name}/best_checkpoint/model.ckpt")
 
     if not ckpt_path.exists():
         logger.error(f"检查点不存在: {ckpt_path}")
@@ -815,7 +859,7 @@ def main():
         return
 
     # 输出目录
-    output_dir = Path(f"results/lightglue_gen/{args.name}/{args.test_name}")
+    output_dir = Path(f"results/mambaglue_gen/{args.name}/{args.test_name}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # 日志
@@ -840,7 +884,7 @@ def main():
 
     # 获取配置
     import importlib
-    module = importlib.import_module('scripts.v2_multi.train_onMultiGen_vessels_enhanced')
+    module = importlib.import_module('scripts.v5_multi.train_onMultiGen_vessels')
     get_default_config = getattr(module, 'get_default_config')
     config = get_default_config()
     config.TRAINER.WORLD_SIZE = len(gpus_list)
@@ -886,10 +930,18 @@ def main():
     baseline_results = None
     if args.baseline:
         logger.info("=" * 60)
-        logger.info("Step 2/2: 测试 Baseline（LightGlue 原生预训练权重）")
+        logger.info("Step 2/2: 测试 Baseline（MambaGlue 原生预训练权重）")
         logger.info("=" * 60)
 
-        baseline_model = BaselineLightGlueModel(config)
+        # 验证预训练权重文件存在
+        if not args.mambaglue_pretrained:
+            logger.error("--baseline 模式必须指定 --mambaglue_pretrained 参数")
+            return
+        if not os.path.exists(args.mambaglue_pretrained):
+            logger.error(f"MambaGlue 预训练权重文件不存在: {args.mambaglue_pretrained}")
+            return
+
+        baseline_model = BaselineMambaGlueModel(config, args.mambaglue_pretrained)
         baseline_model = baseline_model.to(device)
         baseline_model.eval()
 

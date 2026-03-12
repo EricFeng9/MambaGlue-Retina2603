@@ -22,12 +22,12 @@ import logging
 from types import SimpleNamespace
 
 # 添加父目录到 sys.path 以支持导入
-# 先添加 LightGlue 目录，以便导入 lightglue 模块
+# 先添加 MambaGlue 目录，以便导入 mambaglue 模块
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 # 再添加项目根目录，以便导入 dataset 模块
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../..'))
 
-# 导入 LightGlue 相关模块
+# 导入 MambaGlue 相关模块
 from mambaglue import MambaGlue, SuperPoint
 from mambaglue import viz2d
 
@@ -47,8 +47,8 @@ from dataset.CFFA.cffa_dataset import CFFADataset
 from dataset.CF_OCT.cf_oct_dataset import CFOCTDataset
 from dataset.operation_pre_filtered_octfa.operation_pre_filtered_octfa_dataset import OCTFADataset
 
-# 导入统一的测试/验证模块（使用 v2_multi 版本，与 metrics 保持一致）
-from scripts.v2_multi.test import UnifiedEvaluator
+# 导入统一的测试/验证模块（使用 v5_multi 版本，与 metrics 保持一致）
+from scripts.v5_multi.test import UnifiedEvaluator
 
 # ==========================================
 # 配置函数
@@ -168,8 +168,6 @@ def create_chessboard(img1, img2, grid_size=4):
                 chessboard[y_start:y_end, x_start:x_end] = img2[y_start:y_end, x_start:x_end]
     return chessboard
 
-# 导入域随机化增强模块
-from scripts.v2_multi.gen_data_enhance import random_domain_augment_image, random_domain_augment_pair
 
 # ==========================================
 # 辅助类: GenDatasetWrapper (格式转换，适配 260311_multiGen_aug 数据集)
@@ -321,7 +319,7 @@ class RealDatasetWrapper(torch.utils.data.Dataset):
         moving_name = os.path.basename(moving_path)
         
         # 数据集内部计算的 T_0to1 是从 Moving 到 Fix 的变换
-        # 但 LightGlue 默认输出是从 Image0(Fix) -> Image1(Moving) 的变换
+        # 但 MambaGlue 默认输出是从 Image0(Fix) -> Image1(Moving) 的变换
         # 所以这里取逆
         try:
             T_fix_to_moving = torch.inverse(T_0to1)
@@ -355,11 +353,10 @@ class MultimodalDataModule(pl.LightningDataModule):
         if stage == 'fit' or stage is None:
             # 训练集使用生成数据 (260311_multiGen_aug) 的全量数据（train + val）
             # 验证集使用全量真实数据进行验证
-            script_dir = Path(__file__).parent.parent.parent
 
             # 训练集：生成数据 (260311_multiGen_aug) 全量数据 - 支持 cf, fa, oct 随机两两配对
             # 数据在 /data/student/Fengjunming/diffusion_registration/dataset/260311_multiGen_aug
-            train_data_dir = script_dir / '../dataset' / '260311_multiGen_aug'
+            train_data_dir = '/data/student/Fengjunming/diffusion_registration/dataset/260311_multiGen_aug'
 
             # 加载 train split
             train_base = MultiModalDataset(
@@ -388,19 +385,19 @@ class MultimodalDataModule(pl.LightningDataModule):
             # CFFA 和 CFOCT 使用全量数据（split='all'）
             
             # 1) CFFA 全量数据集 (来自 dataset/CFFA)
-            cffa_dir = script_dir.parent / 'dataset' / 'CFFA'
+            cffa_dir = '/data/student/Fengjunming/diffusion_registration/dataset/CFFA'
             cffa_base = CFFADataset(root_dir=str(cffa_dir), split='all', mode='fa2cf')
             cffa_dataset = RealDatasetWrapper(cffa_base, split_name='all', dataset_name='CFFA')
             logger.info(f"验证集加载 CFFA 全量集: {len(cffa_dataset)} 样本")
             
             # 2) CFOCT 全量数据集 (来自 dataset/CF_OCT)
-            cfoct_dir = script_dir.parent / 'dataset' / 'CF_OCT'
+            cfoct_dir = '/data/student/Fengjunming/diffusion_registration/dataset/CF_OCT'
             cfoct_base = CFOCTDataset(root_dir=str(cfoct_dir), split='all', mode='oct2cf')
             cfoct_dataset = RealDatasetWrapper(cfoct_base, split_name='all', dataset_name='CFOCT')
             logger.info(f"验证集加载 CFOCT 全量集: {len(cfoct_dataset)} 样本")
             
             # 3) OCTFA val 集 (来自 dataset/operation_pre_filtered_octfa)
-            octfa_dir = script_dir.parent / 'dataset' / 'operation_pre_filtered_octfa'
+            octfa_dir = '/data/student/Fengjunming/diffusion_registration/dataset/operation_pre_filtered_octfa'
             octfa_base = OCTFADataset(root_dir=str(octfa_dir), split='val', mode='fa2oct')
             octfa_dataset = RealDatasetWrapper(octfa_base, split_name='val', dataset_name='OCTFA')
             logger.info(f"验证集加载 OCTFA val 集: {len(octfa_dataset)} 样本")
@@ -418,14 +415,22 @@ class MultimodalDataModule(pl.LightningDataModule):
         )
 
 # ==========================================
-# 核心模型: PL_LightGlue_Gen
+# 核心模型: PL_MambaGlue_Gen
 # ==========================================
-class PL_LightGlue_Gen(pl.LightningModule):
-    """LightGlue 的 PyTorch Lightning 封装（用于生成数据训练）"""
-    def __init__(self, config, result_dir=None):
+class PL_MambaGlue_Gen(pl.LightningModule):
+    """MambaGlue 的 PyTorch Lightning 封装（用于生成数据训练）"""
+    def __init__(self, config, result_dir=None, mambaglue_pretrained=None, skip_pretrained_load=False):
+        """
+        Args:
+            config: 配置对象
+            result_dir: 结果保存目录
+            mambaglue_pretrained: MambaGlue 预训练权重路径
+            skip_pretrained_load: 如果为 True，跳过预训练权重加载（用于从 checkpoint 加载时）
+        """
         super().__init__()
         self.config = config
         self.result_dir = result_dir
+        self.mambaglue_pretrained = mambaglue_pretrained
         self.save_hyperparameters({'config': str(config)})
         
         # 1. 特征提取器 (SuperPoint) - 冻结
@@ -433,9 +438,54 @@ class PL_LightGlue_Gen(pl.LightningModule):
         for param in self.extractor.parameters():
             param.requires_grad = False
             
-        # 2. 匹配器 (LightGlue) - 可训练
+        # 2. 匹配器 (MambaGlue) - 可训练
         lg_conf = config.MATCHING.copy()
         self.matcher = MambaGlue(**lg_conf)
+        
+        # 加载 MambaGlue 预训练权重（仅在训练时需要，从 checkpoint 加载时跳过）
+        if not skip_pretrained_load:
+            if not self.mambaglue_pretrained:
+                raise ValueError("必须指定 MambaGlue 预训练权重路径 (--mambaglue_pretrained)")
+            
+            if not os.path.exists(self.mambaglue_pretrained):
+                raise FileNotFoundError(f"MambaGlue 预训练权重文件不存在: {self.mambaglue_pretrained}")
+            
+            try:
+                ckpt = torch.load(self.mambaglue_pretrained, map_location='cpu', weights_only=False)
+                if 'model' in ckpt:
+                    state_dict = ckpt['model']
+                else:
+                    state_dict = ckpt
+                
+                # 关键：预训练权重键名需要映射才能匹配模型
+                # 参考 MambaGlue 类内部的 state_dict 处理逻辑
+                # 1. 移除 "matcher." 前缀
+                state_dict = {k.replace("matcher.", ""): v for k, v in state_dict.items()}
+                # 2. 移除 "extractor" 前缀
+                state_dict = {k.replace("extractor", ""): v for k, v in state_dict.items()}
+                # 3. transformers -> transformermambas (模块重命名)
+                state_dict = {k.replace("transformers.", "transformermambas."): v for k, v in state_dict.items()}
+                # 4. mamba_self_attn -> mamba_selfattn_mixer (子模块重命名)
+                state_dict = {k.replace("mamba_self_attn.", "mamba_selfattn_mixer."): v for k, v in state_dict.items()}
+                
+                # 加载权重，允许不严格匹配
+                missing_keys, unexpected_keys = self.matcher.load_state_dict(state_dict, strict=False)
+                
+                # 检查是否有任何权重被成功加载
+                matched_keys = set(state_dict.keys()) - set(unexpected_keys)
+                if len(matched_keys) == 0:
+                    raise RuntimeError("预训练权重加载失败：没有任何权重被成功匹配！请检查预训练权重文件格式。")
+                
+                if missing_keys:
+                    logger.warning(f"预训练权重中缺失的键: {missing_keys}")
+                if unexpected_keys:
+                    logger.warning(f"预训练权重中多余的键: {unexpected_keys}")
+                logger.info(f"成功加载 MambaGlue 预训练权重: {self.mambaglue_pretrained}")
+                logger.info(f"成功匹配 {len(matched_keys)}/{len(state_dict)} 个权重键")
+            except RuntimeError as e:
+                raise RuntimeError(f"加载 MambaGlue 预训练权重失败: {e}")
+            except Exception as e:
+                raise RuntimeError(f"加载 MambaGlue 预训练权重失败: {e}")
         
         # 用于控制是否强制可视化
         self.force_viz = False
@@ -484,7 +534,7 @@ class PL_LightGlue_Gen(pl.LightningModule):
                     'scores1': feats1['keypoint_scores']
                 })
         
-        # LightGlue 匹配
+        # MambaGlue 匹配
         data = {
             'image0': {
                 'keypoints': batch['keypoints0'],
@@ -703,7 +753,7 @@ class MultimodalValidationCallback(Callback):
         super().__init__()
         self.args = args
         self.best_val = -1.0
-        self.result_dir = Path(f"results/lightglue_gen/{args.name}")
+        self.result_dir = Path(f"results/mambaglue_gen/{args.name}")
         self.result_dir.mkdir(parents=True, exist_ok=True)
         self.epoch_mses = []
         self.epoch_maces = []
@@ -1010,7 +1060,7 @@ class DelayedEarlyStopping(EarlyStopping):
 # 参数解析和主函数
 # ==========================================
 def parse_args():
-    parser = argparse.ArgumentParser(description="LightGlue Vessel-Guided Training")
+    parser = argparse.ArgumentParser(description="MambaGlue Vessel-Guided Training")
     parser.add_argument('--name', '-n', type=str, default='260303_vessel_guided', help='训练名称')
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--num_workers', type=int, default=0)
@@ -1018,6 +1068,9 @@ def parse_args():
     parser.add_argument('--start_point', type=str, default=None, help='从检查点恢复训练')
     parser.add_argument('--max_epochs', type=int, default=200)
     parser.add_argument('--gpus', type=str, default='1')
+    parser.add_argument('--mambaglue_pretrained', type=str,
+                        default='/data/student/Fengjunming/diffusion_registration/MambaGlue-Retina2603/superpoint_mambaglue.tar',
+                        help='MambaGlue 预训练权重路径 (.tar 或 .ckpt 格式)')
     
     # 课程学习参数
     parser.add_argument('--teaching_end', type=int, default=50, help='教学期结束 epoch')
@@ -1038,7 +1091,7 @@ def main():
     pl.seed_everything(config.TRAINER.SEED)
     
     # 修复路径
-    result_dir = Path(f"results/lightglue_{args.mode}/{args.name}")
+    result_dir = Path(f"results/mambaglue_{args.mode}/{args.name}")
     result_dir.mkdir(parents=True, exist_ok=True)
     log_file = result_dir / "log.txt"
     
@@ -1070,13 +1123,13 @@ def main():
     config.TRAINER.TRUE_LR = config.TRAINER.CANONICAL_LR * _scaling
     
     # 初始化模型
-    model = PL_LightGlue_Gen(config, result_dir=str(result_dir))
+    model = PL_MambaGlue_Gen(config, result_dir=str(result_dir), mambaglue_pretrained=args.mambaglue_pretrained)
     
     # 初始化数据模块
     data_module = MultimodalDataModule(args, config)
     
     # TensorBoard 日志
-    tb_logger = TensorBoardLogger(save_dir='logs/tb_logs', name=f"lightglue_{args.name}")
+    tb_logger = TensorBoardLogger(save_dir='logs/tb_logs', name=f"mambaglue_{args.name}")
     
     # 早停配置
     early_stop_callback = DelayedEarlyStopping(
@@ -1136,6 +1189,11 @@ def main():
     
     # 如果指定了检查点，从检查点恢复
     ckpt_path = args.start_point if args.start_point else None
+    
+    if args.mambaglue_pretrained:
+        logger.info(f"MambaGlue 预训练权重: {args.mambaglue_pretrained}")
+    else:
+        logger.info("未指定 MambaGlue 预训练权重，将从头开始训练")
     
     logger.info(f"开始训练 (训练集: 260311_multiGen_aug 生成数据 | 验证集: CFFA+CFOCT+OCTFA 合并真实数据(全量)): {args.name}")
     logger.info("策略: 血管loss引导的课程学习")
