@@ -27,8 +27,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../..'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
 # 导入 LightGlue 预训练模型
-from lightglue import LightGlue
-from lightglue.superpoint import SuperPoint
+from mambaglue import MambaGlue
+from mambaglue.superpoint import SuperPoint
 
 # 导入 metrics（使用 v2_multi 版本的 metrics，与训练保持一致）
 from scripts.v2_multi.metrics import (
@@ -455,7 +455,7 @@ def _visualize_batch(batch, outputs, output_dir, batch_idx, sample_counter=0):
     返回更新后的 sample_counter
     """
     import matplotlib.pyplot as plt
-    from lightglue import viz2d
+    from mambaglue import viz2d
 
     output_dir = Path(output_dir)
     batch_size = batch['image0'].shape[0]
@@ -775,8 +775,8 @@ def main():
                 # 2. 匹配器 (LightGlue) - 使用预训练权重
                 lg_conf = config.MATCHING.copy()
                 # 强制加载预训练权重
-                lg_conf['weights'] = 'superpoint_lightglue'
-                self.matcher = LightGlue(**lg_conf).eval()
+                lg_conf['weights'] = 'superpoint_mambaglue'
+                self.matcher = MambaGlue(**lg_conf).eval()
                 for param in self.matcher.parameters():
                     param.requires_grad = False
 

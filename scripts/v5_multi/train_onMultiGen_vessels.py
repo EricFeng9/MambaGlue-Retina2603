@@ -28,8 +28,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../..'))
 
 # 导入 LightGlue 相关模块
-from lightglue import LightGlue, SuperPoint
-from lightglue import viz2d
+from mambaglue import MambaGlue, SuperPoint
+from mambaglue import viz2d
 
 # 导入生成数据集 (260311_multiGen_aug)
 # 注意：由于文件夹名包含点号，需要使用 importlib 动态导入
@@ -435,7 +435,7 @@ class PL_LightGlue_Gen(pl.LightningModule):
             
         # 2. 匹配器 (LightGlue) - 可训练
         lg_conf = config.MATCHING.copy()
-        self.matcher = LightGlue(**lg_conf)
+        self.matcher = MambaGlue(**lg_conf)
         
         # 用于控制是否强制可视化
         self.force_viz = False

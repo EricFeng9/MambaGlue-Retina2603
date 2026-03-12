@@ -28,8 +28,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../..'))
 
 # 导入 LightGlue
-from lightglue import LightGlue, SuperPoint
-from lightglue import viz2d
+from mambaglue import MambaGlue, SuperPoint
+from mambaglue import viz2d
 
 # 导入数据集（使用与 test.py 一致的数据集）
 from dataset.CFFA.cffa_dataset import CFFADataset
@@ -340,7 +340,7 @@ class PL_LightGlue_Real(pl.LightningModule):
             param.requires_grad = False
             
         lg_conf = config.MATCHING.copy()
-        self.matcher = LightGlue(**lg_conf)
+        self.matcher = MambaGlue(**lg_conf)
         
         self.force_viz = False
         

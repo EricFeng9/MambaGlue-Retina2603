@@ -26,8 +26,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../..'))
 # 再添加 LightGlue 目录，以便导入 lightglue 模块
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
-from lightglue import LightGlue
-from lightglue.superpoint import SuperPoint
+from mambaglue import MambaGlue
+from mambaglue.superpoint import SuperPoint
 
 # 导入 metrics（使用 v2_multi 版本的 metrics，与训练保持一致）
 from scripts.v2_multi.metrics import (
@@ -402,7 +402,7 @@ def _visualize_samples(batch, outputs, output_dir, batch_idx, viz_counters, max_
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     try:
-        from lightglue import viz2d
+        from mambaglue import viz2d
         has_viz2d = True
     except Exception:
         has_viz2d = False
@@ -571,8 +571,8 @@ class BaselineLightGlueModel(pl.LightningModule):
             param.requires_grad = False
 
         lg_conf = config.MATCHING.copy()
-        lg_conf['weights'] = 'superpoint_lightglue'
-        self.matcher = LightGlue(**lg_conf).eval()
+        lg_conf['weights'] = 'superpoint_mambaglue'
+        self.matcher = MambaGlue(**lg_conf).eval()
         for param in self.matcher.parameters():
             param.requires_grad = False
 
