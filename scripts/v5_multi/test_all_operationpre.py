@@ -185,7 +185,9 @@ def build_full_dataset(dataset_cls, root_dir, mode, dataset_name):
 
 
 def build_all_dataloaders(args):
-    """返回 {dataset_name: DataLoader} 字典，每个数据集独立一个 DataLoader"""
+    """返回 {dataset_name: DataLoader} 字典，每个数据集独立一个 DataLoader
+    如果 args.all 为 True，则合并所有数据集为一个 'ALL' 数据集
+    """
 
     loader_params = {
         'batch_size': args.batch_size,
@@ -203,6 +205,14 @@ def build_all_dataloaders(args):
         'CFOCT': build_full_dataset(CFOCTDataset, cfoct_dir, 'oct2cf', 'CFOCT'),
         'OCTFA': build_full_dataset(OCTFADataset, octfa_dir, 'fa2oct', 'OCTFA'),
     }
+
+    # 如果指定了 --all，合并所有数据集为一个
+    if getattr(args, 'all', False):
+        all_datasets = list(datasets.values())
+        merged_dataset = ConcatDataset(all_datasets)
+        total_samples = sum(len(ds) for ds in all_datasets)
+        logger.info(f"--all 模式: 合并所有数据集，共 {total_samples} 样本")
+        return {'ALL': DataLoader(merged_dataset, **loader_params)}
 
     return {name: DataLoader(ds, **loader_params) for name, ds in datasets.items()}
 
@@ -569,6 +579,9 @@ def run_evaluation_per_dataset(model, dataloaders, config, save_visualizations=F
                 'mse': metrics['mse'],
                 'mace': metrics['mace'],
                 'num_samples': metrics['total_samples'],
+                'failed': metrics.get('failed_samples', 0),
+                'inaccurate': metrics.get('inaccurate_samples', 0),
+                'acceptable': metrics.get('acceptable_samples', 0),
             }
         logger.info(f"  [{ds_name}] AUC@5={ds_metrics['auc@5']:.4f} AUC@10={ds_metrics['auc@10']:.4f} "
                     f"AUC@20={ds_metrics['auc@20']:.4f} mAUC={ds_metrics['mAUC']:.4f} "
@@ -690,16 +703,27 @@ METRIC_KEYS = ['num_samples', 'failed', 'inaccurate', 'acceptable', 'auc@5', 'au
 METRIC_DISPLAY = ['Samples', 'Failed', 'Inacc', 'Accept', 'AUC@5', 'AUC@10', 'AUC@20', 'mAUC', 'Combined_AUC', 'MSE', 'MACE']
 
 
+def get_dataset_order(results):
+    """根据结果动态决定数据集遍历顺序
+    如果结果中有 'ALL' 键（--all 模式），返回 ['ALL']；
+    否则返回默认的 DATASET_ORDER
+    """
+    if results and 'ALL' in results:
+        return ['ALL']
+    return DATASET_ORDER
+
+
 def save_summary_txt(output_dir, label, results_per_ds):
     """保存单模型测试总结"""
     summary_path = output_dir / f"test_summary_{label}.txt"
+    dataset_order = get_dataset_order(results_per_ds)
     with open(summary_path, "w") as f:
         f.write(f"测试总结 [{label}]\n")
         f.write("=" * 60 + "\n")
         f.write("说明: AUC 使用全部样本(Failed=1e6+Inaccurate+Acceptable)；MSE/MACE 仅对 Acceptable 求平均。\n")
         f.write("若某模态 Trained 的 Inaccurate 多于 Baseline，则可能出现 AUC 更低但 MSE/MACE 更优。\n")
         f.write("-" * 60 + "\n")
-        for ds_name in DATASET_ORDER:
+        for ds_name in dataset_order:
             if ds_name not in results_per_ds:
                 continue
             m = results_per_ds[ds_name]
@@ -721,6 +745,7 @@ def save_comparison_csv(output_dir, trained_results, baseline_results=None):
     列：Dataset | Metric | Trained | Baseline (如有)
     """
     csv_path = output_dir / "comparison_results.csv"
+    dataset_order = get_dataset_order(trained_results)
 
     with open(csv_path, "w", newline='', encoding='utf-8') as csvfile:
         writer = csv.writer(csvfile)
@@ -733,7 +758,7 @@ def save_comparison_csv(output_dir, trained_results, baseline_results=None):
         else:
             writer.writerow(['Dataset', 'Metric', 'Trained (MultiGen)'])
 
-        for ds_name in DATASET_ORDER:
+        for ds_name in dataset_order:
             trained_m = trained_results.get(ds_name, {})
             if baseline_results is not None:
                 baseline_m = baseline_results.get(ds_name, {})
@@ -763,7 +788,7 @@ def save_comparison_csv(output_dir, trained_results, baseline_results=None):
         if baseline_results is not None:
             header = ['Dataset', 'Model'] + METRIC_DISPLAY
             writer.writerow(header)
-            for ds_name in DATASET_ORDER:
+            for ds_name in dataset_order:
                 trained_m = trained_results.get(ds_name, {})
                 baseline_m = baseline_results.get(ds_name, {})
                 trained_row = [ds_name, 'Trained (MultiGen)']
@@ -779,7 +804,7 @@ def save_comparison_csv(output_dir, trained_results, baseline_results=None):
         else:
             header = ['Dataset'] + METRIC_DISPLAY
             writer.writerow(header)
-            for ds_name in DATASET_ORDER:
+            for ds_name in dataset_order:
                 m = trained_results.get(ds_name, {})
                 row = [ds_name]
                 for mk in METRIC_KEYS:
@@ -800,7 +825,8 @@ def print_comparison_table(trained_results, baseline_results=None):
     logger.info("  ".join(header_parts))
     logger.info("-" * 130)
 
-    for ds_name in DATASET_ORDER:
+    dataset_order = get_dataset_order(trained_results)
+    for ds_name in dataset_order:
         trained_m = trained_results.get(ds_name, {})
         row = [ds_name.ljust(8), 'Trained (MultiGen)'.ljust(24)]
         for mk in METRIC_KEYS:
@@ -842,6 +868,7 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=None, help='随机种子（不指定则自动生成）')
     parser.add_argument('--gpus', type=str, default='0', help='GPU设备ID')
     parser.add_argument('--no_viz', action='store_true', help='禁用可视化')
+    parser.add_argument('--all', action='store_true', help='合并所有数据集为一个整体进行测试，不区分模态')
 
     return parser.parse_args()
 
