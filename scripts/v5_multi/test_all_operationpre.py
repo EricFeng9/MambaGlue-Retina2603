@@ -18,7 +18,24 @@ from loguru import logger
 import argparse
 import pytorch_lightning as pl
 from torch.utils.data import ConcatDataset, DataLoader
+from torch.utils.data.dataloader import default_collate
 import csv
+
+
+def collate_fn_allow_variable_gt_pts(batch):
+    """Custom collate: keep gt_pts0/gt_pts1 as list of tensors (variable length), rest default."""
+    if not batch:
+        return default_collate(batch)
+    first = batch[0]
+    if not isinstance(first, dict):
+        return default_collate(batch)
+    out = {}
+    for k in first.keys():
+        if k in ('gt_pts0', 'gt_pts1'):
+            out[k] = [sample[k] for sample in batch]
+            continue
+        out[k] = default_collate([sample[k] for sample in batch])
+    return out
 
 # 添加父目录到 sys.path
 # 先添加项目根目录，以便导入 dataset 模块
@@ -41,6 +58,12 @@ from scripts.v5_multi.metrics import (
 from dataset.operation_pre_filtered_cffa.operation_pre_filtered_cffa_dataset import CFFADataset
 from dataset.operation_pre_filtered_cfoct.operation_pre_filtered_cfoct_dataset import CFOCTDataset
 from dataset.operation_pre_filtered_octfa.operation_pre_filtered_octfa_dataset import OCTFADataset
+
+# 导入 operation_intra 数据集（模态内配准）
+from dataset.operation_pre2intra.operation_intra import IntraDataset
+
+# 导入 operation_B2A 数据集（混合模态）
+from dataset.operation_B2A.operation_B2A import B2ADataset
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +210,8 @@ def build_full_dataset(dataset_cls, root_dir, mode, dataset_name):
 def build_all_dataloaders(args):
     """返回 {dataset_name: DataLoader} 字典，每个数据集独立一个 DataLoader
     如果 args.all 为 True，则合并所有数据集为一个 'ALL' 数据集
+    如果 args.intra 为 True，则使用 operation_pre2intra 数据集的全量
+    如果 args.B2A 为 True，则使用 operation_B2A 数据集的全量
     """
 
     loader_params = {
@@ -194,11 +219,26 @@ def build_all_dataloaders(args):
         'num_workers': args.num_workers,
         'pin_memory': True,
         'shuffle': False,
+        'collate_fn': collate_fn_allow_variable_gt_pts,
     }
 
     cffa_dir = '/data/student/Fengjunming/diffusion_registration/dataset/operation_pre_filtered_cffa'
     cfoct_dir = '/data/student/Fengjunming/diffusion_registration/dataset/operation_pre_filtered_cfoct'
     octfa_dir = '/data/student/Fengjunming/diffusion_registration/dataset/operation_pre_filtered_octfa'
+
+    # --intra 模式：使用 operation_pre2intra 数据集（全量 train+val）
+    if getattr(args, 'intra', False):
+        intra_dir = '/data/student/Fengjunming/diffusion_registration/dataset/operation_pre2intra'
+        intra_full = build_full_dataset(IntraDataset, intra_dir, None, 'INTRA')
+        logger.info(f"--intra 模式: 使用 operation_pre2intra 全量数据集，共 {len(intra_full)} 样本")
+        return {'INTRA': DataLoader(intra_full, **loader_params)}
+
+    # --B2A 模式：使用 operation_B2A 数据集（全量 train+val）
+    if getattr(args, 'B2A', False):
+        b2a_dir = '/data/student/Fengjunming/diffusion_registration/dataset/operation_B2A'
+        b2a_full = build_full_dataset(B2ADataset, b2a_dir, None, 'B2A')
+        logger.info(f"--B2A 模式: 使用 operation_B2A 全量数据集，共 {len(b2a_full)} 样本")
+        return {'B2A': DataLoader(b2a_full, **loader_params)}
 
     datasets = {
         'CFFA': build_full_dataset(CFFADataset, cffa_dir, 'fa2cf', 'CFFA'),
@@ -698,7 +738,7 @@ def load_trained_model(ckpt_path, config, output_dir):
 # 结果保存
 # ---------------------------------------------------------------------------
 
-DATASET_ORDER = ['CFFA', 'CFOCT', 'OCTFA']
+DATASET_ORDER = ['CFFA', 'CFOCT', 'OCTFA', 'INTRA', 'B2A']
 METRIC_KEYS = ['num_samples', 'failed', 'inaccurate', 'acceptable', 'auc@5', 'auc@10', 'auc@20', 'mAUC', 'combined_auc', 'mse', 'mace']
 METRIC_DISPLAY = ['Samples', 'Failed', 'Inacc', 'Accept', 'AUC@5', 'AUC@10', 'AUC@20', 'mAUC', 'Combined_AUC', 'MSE', 'MACE']
 
@@ -706,10 +746,17 @@ METRIC_DISPLAY = ['Samples', 'Failed', 'Inacc', 'Accept', 'AUC@5', 'AUC@10', 'AU
 def get_dataset_order(results):
     """根据结果动态决定数据集遍历顺序
     如果结果中有 'ALL' 键（--all 模式），返回 ['ALL']；
+    如果结果中有 'INTRA' 键（--intra 模式），返回 ['INTRA']；
+    如果结果中有 'B2A' 键（--B2A 模式），返回 ['B2A']；
     否则返回默认的 DATASET_ORDER
     """
-    if results and 'ALL' in results:
-        return ['ALL']
+    if results:
+        if 'ALL' in results:
+            return ['ALL']
+        if 'INTRA' in results:
+            return ['INTRA']
+        if 'B2A' in results:
+            return ['B2A']
     return DATASET_ORDER
 
 
@@ -869,8 +916,20 @@ def parse_args():
     parser.add_argument('--gpus', type=str, default='0', help='GPU设备ID')
     parser.add_argument('--no_viz', action='store_true', help='禁用可视化')
     parser.add_argument('--all', action='store_true', help='合并所有数据集为一个整体进行测试，不区分模态')
+    parser.add_argument('--intra', action='store_true', help='使用 operation_pre2intra 数据集全量测试（训练集+测试集合并），与 --all 互斥')
+    parser.add_argument('--B2A', action='store_true', help='使用 operation_B2A 数据集全量测试（训练集+测试集合并），与 --all 互斥')
 
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # 互斥检查
+    if args.all and args.intra:
+        parser.error("--all 和 --intra 不能同时使用")
+    if args.all and args.B2A:
+        parser.error("--all 和 --B2A 不能同时使用")
+    if args.intra and args.B2A:
+        parser.error("--intra 和 --B2A 不能同时使用")
+
+    return args
 
 
 def main():
@@ -944,6 +1003,7 @@ def main():
     logger.info(f"Checkpoint: {ckpt_path}")
     logger.info(f"输出目录: {output_dir}")
     logger.info(f"Baseline 模式: {args.baseline}")
+    logger.info(f"测试模式: {'--all' if args.all else '--intra' if args.intra else '--B2A' if args.B2A else '分别测试各数据集'}")
 
     # 构建各数据集的 DataLoader（train + val 全量）
     dataloaders = build_all_dataloaders(args)
